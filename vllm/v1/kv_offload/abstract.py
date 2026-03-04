@@ -144,7 +144,7 @@ class OffloadingManager(ABC):
         """
         Marks blocks which were previously prepared to be stored, as stored.
         Following this call, the blocks become loadable.
-        If if_success is False, blocks that were not marked as stored will be
+        If success is False, blocks that were not marked as stored will be
         removed.
 
         Args:
