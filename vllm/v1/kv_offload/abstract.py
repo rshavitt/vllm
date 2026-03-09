@@ -30,11 +30,19 @@ The class provides the following primitives:
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 
 # Type alias for job IDs used in async transfer tracking
 JobId = int
+
+
+class TransferDirection(Enum):
+    """Direction of data transfer in the offloading system."""
+
+    PRIMARY_TO_SECONDARY = "primary_to_secondary"
+    SECONDARY_TO_PRIMARY = "secondary_to_primary"
 
 
 class LoadStoreSpec(ABC):
@@ -69,13 +77,20 @@ class OffloadingEvent:
     removed: bool
 
 
+# PRNOTE: We have two similar result types with overlapping terminology:
+# `JobResult`: primary (CPU) ↔ secondary transfers
+# `TransferResult`: GPU ↔ CPU transfers
+# Both use `job_id`, which is confusing since they operate at different system layers.
+# Should we rename or unify them?
+
+
 @dataclass
-class CompletedJob:
-    """Result of a completed async transfer job."""
+class JobResult:
+    """Result of an async transfer job (successful or failed)."""
 
     job_id: JobId
     block_hashes: list[BlockHash]
-    is_store: bool  # True if primary→secondary, False if secondary→primary
+    direction: TransferDirection
     success: bool
 
 
@@ -175,6 +190,18 @@ class OffloadingManager(ABC):
         """
         return ()
 
+    # PRNOTE: Tier-agnostic API for primary tier operations
+    # These wrapper methods provide intent-based names for tiered manager operations:
+    #
+    # - allocate_blocks()/finalize_blocks() wrap prepare_store()/complete_store()
+    #   for promotion flows (secondary→primary)
+    #
+    # - protect_blocks()/unprotect_blocks() wrap prepare_load()/complete_load()
+    #   for cascade flows (primary→secondary)
+    #
+    # This makes tiered manager code self-documenting and avoids confusing patterns
+    # like calling `primary.prepare_load()` during Store operations.
+
     # Tier-agnostic API for primary tier operations
     # These methods provide intent-based names that work regardless of
     # data flow direction, making tiered manager code self-documenting.
@@ -259,6 +286,11 @@ class SecondaryTierManager(ABC):
     """
 
     @abstractmethod
+    # PRNOTE: Do we want to allow lookup() returning None?
+    # Issue: Returning None for "blocks exist but transferring" is ambiguous.
+    # TieredOffloadingManager treats None as "not found" and checks the next tier,
+    # potentially causing redundant promotions from multiple tiers.
+
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
         """
         Check which blocks exist in this secondary tier.
@@ -288,10 +320,10 @@ class SecondaryTierManager(ABC):
         calling thread.
 
         The caller (TieredOffloadingManager) must have already called
-        primary.prepare_load(block_hashes) to obtain primary_load_spec and
+        primary.protect_blocks(block_hashes) to obtain primary_load_spec and
         to increment ref_cnt on those blocks. ref_cnt will be decremented
         when get_finished() reports this job_id as complete and
-        primary.complete_load() is called.
+        primary.unprotect_blocks() is called.
 
         This method is responsible for:
           1. Filtering out blocks already present in this secondary tier
@@ -304,7 +336,7 @@ class SecondaryTierManager(ABC):
             job_id: Unique identifier for this transfer job.
             block_hashes: Blocks to store.
             primary_load_spec: Spec for reading blocks from the primary tier
-                               (obtained via primary.prepare_load()).
+                               (obtained via primary.protect_blocks()).
 
         Returns:
             PrepareStoreOutput describing which blocks will be stored and
@@ -328,16 +360,16 @@ class SecondaryTierManager(ABC):
         the calling thread.
 
         The caller (TieredOffloadingManager) must have already called
-        primary.prepare_store(block_hashes) to obtain primary_store_spec and
+        primary.allocate_blocks(block_hashes) to obtain primary_store_spec and
         to allocate space in the primary tier. When get_finished() reports
-        this job_id as complete, primary.complete_store() is called to make
+        this job_id as complete, primary.finalize_blocks() is called to make
         the blocks available for GPU loads.
 
         Args:
             job_id: Unique identifier for this transfer job.
             block_hashes: Blocks to load.
             primary_store_spec: Spec for writing blocks into the primary tier
-                                (obtained via primary.prepare_store()).
+                                (obtained via primary.allocate_blocks()).
 
         Returns:
             LoadStoreSpec for reading from this secondary tier, or None if
@@ -346,18 +378,18 @@ class SecondaryTierManager(ABC):
         pass
 
     @abstractmethod
-    def get_finished(self) -> Iterable[CompletedJob]:
+    def get_finished(self) -> Iterable[JobResult]:
         """
-        Poll for completed async jobs (both loads and stores).
+        Poll for finished async jobs (both loads and stores).
 
         This is the mechanism by which the TieredOffloadingManager learns
-        that a transfer has completed and can:
-          - Call primary.complete_load() to decrement ref_cnt (for stores)
-          - Call primary.complete_store() to make blocks loadable (for loads)
+        that a transfer has finished and can:
+          - Call primary.unprotect_blocks() to decrement ref_cnt (for stores)
+          - Call primary.finalize_blocks() to make blocks loadable (for loads)
 
         Returns:
-            Iterable of CompletedJob objects for all jobs that have
-            completed since the last call.
+            Iterable of JobResult objects for all jobs that have
+            finished since the last call.
         """
         pass
 

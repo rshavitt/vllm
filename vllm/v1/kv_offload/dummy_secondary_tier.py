@@ -14,11 +14,12 @@ from collections.abc import Iterable
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
-    CompletedJob,
     JobId,
+    JobResult,
     LoadStoreSpec,
     PrepareStoreOutput,
     SecondaryTierManager,
+    TransferDirection,
 )
 
 
@@ -59,10 +60,10 @@ class DummySecondaryTier(SecondaryTierManager):
         self.in_flight: dict[BlockHash, JobId] = {}
 
         # Completed jobs waiting to be retrieved by get_finished()
-        self.completed_jobs: list[CompletedJob] = []
+        self.completed_jobs: list[JobResult] = []
 
         # Pending jobs (for simulated async mode)
-        self.pending_jobs: list[CompletedJob] = []
+        self.pending_jobs: list[JobResult] = []
 
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
         """
@@ -146,10 +147,10 @@ class DummySecondaryTier(SecondaryTierManager):
             self.in_flight[block_hash] = job_id
 
         # Create completed job
-        completed = CompletedJob(
+        completed = JobResult(
             job_id=job_id,
             block_hashes=blocks_to_store,
-            is_store=True,
+            direction=TransferDirection.PRIMARY_TO_SECONDARY,
             success=True,
         )
 
@@ -195,10 +196,10 @@ class DummySecondaryTier(SecondaryTierManager):
             self.in_flight[block_hash] = job_id
 
         # Create completed job
-        completed = CompletedJob(
+        completed = JobResult(
             job_id=job_id,
             block_hashes=block_hashes_list,
-            is_store=False,
+            direction=TransferDirection.SECONDARY_TO_PRIMARY,
             success=True,
         )
 
@@ -211,18 +212,18 @@ class DummySecondaryTier(SecondaryTierManager):
 
         return primary_store_spec  # Dummy spec
 
-    def get_finished(self) -> Iterable[CompletedJob]:
+    def get_finished(self) -> Iterable[JobResult]:
         """
-        Poll for completed async jobs.
+        Poll for finished async jobs.
 
         Returns:
-            Iterable of CompletedJob objects for all jobs that have
-            completed since the last call.
+            Iterable of JobResult objects for all jobs that have
+            finished since the last call.
         """
         # Move pending jobs to completed
         if self.simulate_async and self.pending_jobs:
             for job in self.pending_jobs:
-                if job.is_store:
+                if job.direction == TransferDirection.PRIMARY_TO_SECONDARY:
                     self._complete_store_job(job)
                 else:
                     self._complete_load_job(job)
@@ -233,14 +234,14 @@ class DummySecondaryTier(SecondaryTierManager):
         self.completed_jobs = []
         return result
 
-    def _complete_store_job(self, job: CompletedJob):
+    def _complete_store_job(self, job: JobResult):
         """Complete a store job by adding blocks to storage."""
         for block_hash in job.block_hashes:
             self.blocks[block_hash] = True
             del self.in_flight[block_hash]
         self.completed_jobs.append(job)
 
-    def _complete_load_job(self, job: CompletedJob):
+    def _complete_load_job(self, job: JobResult):
         """Complete a load job by removing in-flight markers."""
         for block_hash in job.block_hashes:
             del self.in_flight[block_hash]

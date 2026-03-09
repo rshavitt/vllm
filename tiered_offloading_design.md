@@ -625,9 +625,9 @@ Scheduler          TieredManager       Primary          Secondary Tier
 
 ## 7. Migration Strategy and Usage
 
-### 7.1 Using TierOffloadingManagerSpec
+### 7.1 Using TierOffloadingSpec
 
-[`TierOffloadingManagerSpec`](vllm/v1/kv_offload/tiered.py) provides a high-level interface for configuring tiered offloading in vLLM. It is registered in [`OffloadingSpecFactory`](vllm/v1/kv_offload/factory.py) and can be used via `KVTransferConfig`.
+[`TierOffloadingSpec`](vllm/v1/kv_offload/tiered.py) provides a high-level interface for configuring tiered offloading in vLLM. It is registered in [`OffloadingSpecFactory`](vllm/v1/kv_offload/factory.py) and can be used via `KVTransferConfig`.
 
 **Configuration via KVTransferConfig:**
 ```python
@@ -637,7 +637,7 @@ kv_transfer_config = KVTransferConfig(
     kv_connector="OffloadingConnector",
     kv_role="kv_both",
     kv_connector_extra_config={
-        "spec_name": "TierOffloadingManagerSpec",  # Use tiered spec
+        "spec_name": "TierOffloadingSpec",  # Use tiered spec
         "cpu_bytes_to_use": 10 * 1024 * 1024 * 1024,  # Required: 10 GB for CPU tier
         "block_size": 16,  # Optional: offloaded block size
         "eviction_policy": "lru",  # Optional: "lru" or "arc" (default: "lru")
@@ -677,7 +677,7 @@ kv_transfer_config = KVTransferConfig(
     kv_connector="OffloadingConnector",
     kv_role="kv_both",
     kv_connector_extra_config={
-        "spec_name": "TierOffloadingManagerSpec",
+        "spec_name": "TierOffloadingSpec",
         "cpu_bytes_to_use": 5 * 1024 * 1024 * 1024,  # 5 GB
         "eviction_policy": "lru"
     }
@@ -690,7 +690,7 @@ kv_transfer_config = KVTransferConfig(
     kv_connector="OffloadingConnector",
     kv_role="kv_both",
     kv_connector_extra_config={
-        "spec_name": "TierOffloadingManagerSpec",
+        "spec_name": "TierOffloadingSpec",
         "cpu_bytes_to_use": 5 * 1024 * 1024 * 1024,  # 5 GB
         "eviction_policy": "arc",
         "secondary_tiers": [
@@ -706,7 +706,7 @@ kv_transfer_config = KVTransferConfig(
     kv_connector="OffloadingConnector",
     kv_role="kv_both",
     kv_connector_extra_config={
-        "spec_name": "TierOffloadingManagerSpec",
+        "spec_name": "TierOffloadingSpec",
         "cpu_bytes_to_use": 10 * 1024 * 1024 * 1024,  # 10 GB
         "secondary_tiers": [
             {"type": "dummy", "tier_name": "FastStorage", "max_blocks": 20000},
@@ -746,7 +746,7 @@ manager = TieredOffloadingManager(
 
 ### 7.3 Backward Compatibility
 
-`TierOffloadingManagerSpec` is fully backward compatible:
+`TierOffloadingSpec` is fully backward compatible:
 - Works with no secondary tiers (behaves like single-tier CPU offloading)
 - Existing `CPUOffloadingSpec` continues to work unchanged
 - Can be used as a drop-in replacement by changing `spec_name` in config
@@ -769,7 +769,7 @@ kv_transfer_config = KVTransferConfig(
 To add a new secondary tier type (e.g., "storage", "network"):
 
 1. Implement a class that extends [`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:179)
-2. Add the type to `_create_secondary_tier()` in [`TierOffloadingManagerSpec`](vllm/v1/kv_offload/tiered.py)
+2. Add the type to `_create_secondary_tier()` in [`TierOffloadingSpec`](vllm/v1/kv_offload/tiered.py)
 
 Example:
 ```python
@@ -800,8 +800,8 @@ def _create_secondary_tier(self, tier_config: dict):
 - ✅ Added comprehensive unit tests in [`test_tiered_offloading.py`](tests/v1/kv_offload/test_tiered_offloading.py)
 - ✅ All 16 tests passing
 
-**Phase 3: TierOffloadingManagerSpec** ✅ **COMPLETE**
-- ✅ Implemented [`TierOffloadingManagerSpec`](vllm/v1/kv_offload/tiered.py)
+**Phase 3: TierOffloadingSpec** ✅ **COMPLETE**
+- ✅ Implemented [`TierOffloadingSpec`](vllm/v1/kv_offload/tiered.py)
 - ✅ Registered in [`OffloadingSpecFactory`](vllm/v1/kv_offload/factory.py)
 - ✅ Configuration via `kv_connector_extra_config`
 - ✅ Support for multiple secondary tiers
@@ -832,7 +832,7 @@ This design provides a comprehensive architecture for multi-tier KV cache offloa
 8. ✅ Delegates eviction responsibility to each secondary tier
 9. ✅ Maintains backward compatibility
 10. ✅ All Scheduler-side methods are lightweight and non-blocking
-11. ✅ **Provides [`TierOffloadingManagerSpec`](vllm/v1/kv_offload/tiered.py) for easy configuration and usage**
+11. ✅ **Provides [`TierOffloadingSpec`](vllm/v1/kv_offload/tiered.py) for easy configuration and usage**
 12. ✅ **Tier-agnostic API makes code self-documenting and separates concerns from data flow direction**
 
 **Implementation Status:**
@@ -842,7 +842,7 @@ This design provides a comprehensive architecture for multi-tier KV cache offloa
 **Key Files:**
 - [`vllm/v1/kv_offload/abstract.py`](vllm/v1/kv_offload/abstract.py) - Core abstractions (`SecondaryTierManager`, `CompletedJob`)
 - [`vllm/v1/kv_offload/tiered_manager.py`](vllm/v1/kv_offload/tiered_manager.py) - `TieredOffloadingManager` implementation
-- [`vllm/v1/kv_offload/tiered.py`](vllm/v1/kv_offload/tiered.py) - `TierOffloadingManagerSpec` for configuration
+- [`vllm/v1/kv_offload/tiered.py`](vllm/v1/kv_offload/tiered.py) - `TierOffloadingSpec` for configuration
 - [`vllm/v1/kv_offload/dummy_secondary_tier.py`](vllm/v1/kv_offload/dummy_secondary_tier.py) - Testing implementation
 - [`vllm/v1/kv_offload/factory.py`](vllm/v1/kv_offload/factory.py) - Spec registration
 - [`tests/v1/kv_offload/test_tiered_offloading.py`](tests/v1/kv_offload/test_tiered_offloading.py) - Comprehensive tests (16/16 passing)

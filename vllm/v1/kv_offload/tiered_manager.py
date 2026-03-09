@@ -30,6 +30,7 @@ from vllm.v1.kv_offload.abstract import (
     OffloadingManager,
     PrepareStoreOutput,
     SecondaryTierManager,
+    TransferDirection,
 )
 
 
@@ -44,7 +45,7 @@ class TieredOffloadingManager(OffloadingManager):
     Key internal state:
       - Minimal state tracking; relies on secondary tiers to report completion
         via get_finished()
-      - Secondary tiers return CompletedJob objects containing all necessary
+      - Secondary tiers return JobResult objects containing all necessary
         information
       - job_id_counter: monotonically increasing counter for job IDs
     """
@@ -89,16 +90,16 @@ class TieredOffloadingManager(OffloadingManager):
            to make blocks available
         """
         for tier in self.secondary_tiers:
-            for completed in tier.get_finished():
-                if completed.is_store:
+            for completed_job in tier.get_finished():
+                if completed_job.direction == TransferDirection.PRIMARY_TO_SECONDARY:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
-                    self.primary_tier.unprotect_blocks(completed.block_hashes)
+                    self.primary_tier.unprotect_blocks(completed_job.block_hashes)
                 else:
                     # secondary→primary transfer (promotion) completed.
                     # Make blocks available in primary tier.
                     self.primary_tier.finalize_blocks(
-                        completed.block_hashes, completed.success
+                        completed_job.block_hashes, completed_job.success
                     )
 
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
@@ -107,9 +108,10 @@ class TieredOffloadingManager(OffloadingManager):
 
         Algorithm:
         1. Check primary tier first
-        2. If not all blocks found, check secondary tiers
-        3. If found in secondary tier, initiate promotion and return None
-           (retry later)
+        2. If not all blocks found, check all secondary tiers sequentially,
+           promoting blocks from each tier that has hits and updating the
+           remaining blocks to search for
+        3. Return None to signal "retry later" if any promotions were initiated
 
         Args:
             block_hashes: Block hashes to look up.
@@ -118,6 +120,10 @@ class TieredOffloadingManager(OffloadingManager):
             Number of consecutive blocks (from start) that are present,
             or None if blocks are being transferred (retry later).
         """
+        # Process any completed async jobs first to ensure promoted blocks
+        # are finalized and available in the primary tier
+        self._process_finished_jobs()
+
         block_hashes_list = list(block_hashes)
 
         # Step 1: Check primary tier
@@ -131,22 +137,34 @@ class TieredOffloadingManager(OffloadingManager):
             # All blocks in primary tier
             return primary_hits
 
-        # Step 2: Check secondary tiers for remaining blocks
+        # Step 2: Check all secondary tiers for remaining blocks
         remaining_blocks = block_hashes_list[primary_hits:]
 
+        # Track whether any promotions were initiated
+        has_promotions = False
+
         for tier in self.secondary_tiers:
+            if not remaining_blocks:
+                # All blocks have been found
+                break
+
             secondary_hits = tier.lookup(remaining_blocks)
 
-            if secondary_hits is None:
-                # Blocks are being transferred in this tier, retry later
-                return None
+            # Skip if tier is busy (None) or has no hits (0)
+            if not secondary_hits:
+                continue
 
-            if secondary_hits > 0:
-                # Found blocks in this secondary tier, initiate promotion
-                blocks_to_promote = remaining_blocks[:secondary_hits]
-                self._initiate_promotion(tier, blocks_to_promote)
-                # Return None to signal "retry later"
-                return None
+            # Found blocks in this secondary tier, initiate promotion
+            blocks_to_promote = remaining_blocks[:secondary_hits]
+            self._initiate_promotion(tier, blocks_to_promote)
+            has_promotions = True
+
+            # Update remaining_blocks to continue searching for the rest
+            remaining_blocks = remaining_blocks[secondary_hits:]
+
+        # Step 3: If any promotions were initiated, return None to signal retry
+        if has_promotions:
+            return None
 
         # No more blocks found in any tier
         return primary_hits
@@ -181,6 +199,9 @@ class TieredOffloadingManager(OffloadingManager):
         """
         Prepare blocks to be loaded from primary tier to GPU.
 
+        CRITICAL: This method calls _process_finished_jobs() FIRST to ensure
+        that any completed promotions have been finalized and blocks are ready.
+
         This increments ref_cnt on the blocks in the primary tier, protecting
         them from eviction during the transfer.
 
@@ -190,6 +211,9 @@ class TieredOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
+        # Process completed promotions to ensure blocks are ready
+        self._process_finished_jobs()
+
         return self.primary_tier.prepare_load(block_hashes)
 
     def touch(self, block_hashes: Iterable[BlockHash]):
@@ -239,8 +263,6 @@ class TieredOffloadingManager(OffloadingManager):
 
         # Step 2: Store to primary tier
         primary_result = self.primary_tier.prepare_store(block_hashes)
-        if primary_result is None:
-            return None
 
         # Note: Secondary tier cascading will happen in complete_store()
         # after the GPU→Primary transfer completes and blocks are ready.
@@ -264,9 +286,8 @@ class TieredOffloadingManager(OffloadingManager):
             block_hashes: Blocks that finished storing.
             success: Whether the GPU→primary transfer succeeded.
         """
-        # IMPORTANT: Materialize the iterable BEFORE calling primary.complete_store()
-        # because the iterable might be consumed by that call
-        block_hashes_list = list(block_hashes)
+        # Materialize only if success=True (needed for cascading to secondary tiers)
+        block_hashes_list = list(block_hashes) if success else block_hashes
 
         # Step 1: Complete store in primary tier (makes blocks loadable)
         self.primary_tier.complete_store(block_hashes_list, success)

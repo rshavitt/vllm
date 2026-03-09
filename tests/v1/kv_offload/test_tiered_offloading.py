@@ -14,6 +14,7 @@ These tests verify:
 import pytest
 
 from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.kv_offload.abstract import TransferDirection
 from vllm.v1.kv_offload.backends.cpu import CPUBackend
 from vllm.v1.kv_offload.dummy_secondary_tier import DummySecondaryTier
 from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
@@ -113,7 +114,7 @@ class TestDummySecondaryTier:
         completed = list(tier.get_finished())
         assert len(completed) == 1
         assert completed[0].job_id == 1
-        assert completed[0].is_store is True
+        assert completed[0].direction == TransferDirection.PRIMARY_TO_SECONDARY
         assert completed[0].success is True
 
         # Blocks should now be stored
