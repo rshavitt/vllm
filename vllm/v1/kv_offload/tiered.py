@@ -14,11 +14,9 @@ Configuration via kv_connector_extra_config:
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "dummy", "storage", "network")
-      - tier_name: (optional) Name for this tier (default: based on type)
-      - max_blocks: (optional) Maximum blocks for this tier
-      - simulate_async: (optional) For dummy tier: simulate async behavior
-        (default: False)
-      - ... (other tier-specific config)
+      - tier_name: (required) Name for this tier (used for logging and identification)
+      - Additional tier-specific parameters are passed directly to the tier
+        constructor. See each tier's documentation for supported parameters.
 
 Example configuration:
 {
@@ -29,6 +27,7 @@ Example configuration:
         {
             "type": "dummy",
             "tier_name": "TestStorage",
+            # Tier-specific parameters (for DummySecondaryTier):
             "max_blocks": 10000,
             "simulate_async": False
         }
@@ -48,9 +47,9 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
 from vllm.v1.kv_offload.arc_manager import ARCOffloadingManager
 from vllm.v1.kv_offload.backends.cpu import CPUBackend
-from vllm.v1.kv_offload.dummy_secondary_tier import DummySecondaryTier
 from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
+from vllm.v1.kv_offload.secondary_tiers.dummy import DummySecondaryTier
 from vllm.v1.kv_offload.spec import OffloadingSpec
 from vllm.v1.kv_offload.tiered_manager import TieredOffloadingManager
 from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
@@ -130,7 +129,11 @@ class TierOffloadingSpec(OffloadingSpec):
         Create a secondary tier from configuration.
 
         Args:
-            tier_config: Dictionary with tier configuration
+            tier_config: Dictionary with tier configuration containing:
+                - type (required): Type of secondary tier (e.g., "dummy")
+                - tier_name (required): Name for this tier
+                - Additional tier-specific parameters are passed directly
+                  to the tier constructor
 
         Returns:
             SecondaryTierManager instance
@@ -138,21 +141,23 @@ class TierOffloadingSpec(OffloadingSpec):
         Raises:
             ValueError: If tier type is unknown or configuration is invalid
         """
-        tier_type = tier_config.get("type")
+        # Make a copy to avoid modifying the original config
+        config = tier_config.copy()
+
+        # Extract common parameters
+        tier_type = config.pop("type", None)
         if not tier_type:
             raise ValueError("Secondary tier configuration must include 'type'")
 
+        tier_name = config.pop("tier_name", None)
+        if not tier_name:
+            raise ValueError("Secondary tier configuration must include 'tier_name'")
+
+        # Remaining parameters in config are tier-specific
         if tier_type == "dummy":
             # DummySecondaryTier for testing
-            tier_name = tier_config.get("tier_name", "DummyStorage")
-            max_blocks = tier_config.get("max_blocks", 10000)
-            simulate_async = tier_config.get("simulate_async", False)
-
-            return DummySecondaryTier(
-                tier_name=tier_name,
-                max_blocks=max_blocks,
-                simulate_async=simulate_async,
-            )
+            # Pass tier_name and tier-specific params to constructor
+            return DummySecondaryTier(tier_name=tier_name, **config)
         else:
             raise ValueError(
                 f"Unknown secondary tier type: {tier_type}. Supported types: dummy"

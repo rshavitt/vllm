@@ -98,17 +98,23 @@ When there are multiple secondary tiers, `primary.protect_blocks()` must be call
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, PrepareStoreOutput
 
 JobId = int
 
+class TransferDirection(Enum):
+    """Direction of data transfer in the offloading system."""
+    PRIMARY_TO_SECONDARY = "primary_to_secondary"
+    SECONDARY_TO_PRIMARY = "secondary_to_primary"
+
 @dataclass
-class CompletedJob:
+class JobResult:
     """Result of a completed async transfer job."""
     job_id: JobId
     block_hashes: list[BlockHash]
-    is_store: bool  # True if primary→secondary, False if secondary→primary
+    direction: TransferDirection  # Direction of transfer
     success: bool
 
 
@@ -214,7 +220,7 @@ class SecondaryTierManager(ABC):
         pass
 
     @abstractmethod
-    def get_finished(self) -> Iterable[CompletedJob]:
+    def get_finished(self) -> Iterable[JobResult]:
         """
         Poll for completed async jobs (both loads and stores).
 
@@ -224,7 +230,7 @@ class SecondaryTierManager(ABC):
           - Call primary.finalize_blocks() to make blocks loadable (for loads)
 
         Returns:
-            Iterable of CompletedJob objects for all jobs that have
+            Iterable of JobResult objects for all jobs that have
             completed since the last call.
         """
         pass
@@ -302,7 +308,7 @@ class TieredOffloadingManager(OffloadingManager):
 
     Key internal state:
       - Minimal state tracking; relies on secondary tiers to report completion via get_finished()
-      - Secondary tiers return CompletedJob objects containing all necessary information
+      - Secondary tiers return JobResult objects containing all necessary information
       - job_id_counter: monotonically increasing counter for job IDs
     """
 
@@ -310,7 +316,7 @@ class TieredOffloadingManager(OffloadingManager):
         self,
         primary_tier: OffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
-        enable_events: bool = False
+        enable_events: bool = False,
     ):
         self.primary_tier = primary_tier
         self.secondary_tiers = secondary_tiers or []
@@ -392,16 +398,18 @@ This method polls all secondary tiers for completed jobs and updates state accor
 
 ```python
 def _process_finished_jobs(self):
-    for tier_idx, tier in enumerate(self.secondary_tiers):
-        for completed in tier.get_finished():
-            if completed.is_store:
+    for tier in self.secondary_tiers:
+        for completed_job in tier.get_finished():
+            if completed_job.direction == TransferDirection.PRIMARY_TO_SECONDARY:
                 # primary→secondary transfer completed.
                 # Decrement ref_cnt on primary blocks.
-                self.primary_tier.unprotect_blocks(completed.block_hashes)
+                self.primary_tier.unprotect_blocks(completed_job.block_hashes)
             else:
                 # secondary→primary transfer (promotion) completed.
                 # Make blocks available in primary tier.
-                self.primary_tier.finalize_blocks(completed.block_hashes, completed.success)
+                self.primary_tier.finalize_blocks(
+                    completed_job.block_hashes, completed_job.success
+                )
 ```
 
 ---
@@ -426,11 +434,27 @@ def _process_finished_jobs(self):
    # This avoids the need to track in-flight state in TieredOffloadingManager
    ```
 
-3. **Secondary Tier Check**
+3. **Secondary Tier Check** (iterates through all tiers)
    ```python
-   secondary_hits = self._lookup_secondary_tiers(remaining_blocks)
-   if secondary_hits > 0:
-       self._initiate_promotion(remaining_blocks[:secondary_hits])
+   # Track whether any promotions were initiated
+   has_promotions = False
+   
+   for tier in self.secondary_tiers:
+       if not remaining_blocks:
+           break
+       
+       secondary_hits = tier.lookup(remaining_blocks)
+       
+       if secondary_hits and secondary_hits > 0:
+           # Found blocks in this tier, initiate promotion
+           blocks_to_promote = remaining_blocks[:secondary_hits]
+           self._initiate_promotion(tier, blocks_to_promote)
+           has_promotions = True
+           
+           # Update remaining_blocks to continue searching
+           remaining_blocks = remaining_blocks[secondary_hits:]
+   
+   if has_promotions:
        return None  # Promotion initiated, retry later
    ```
 
@@ -516,7 +540,7 @@ When there are N secondary tiers, `primary.protect_blocks()` is called N times f
 │                    TieredOffloadingManager                  │
 │                  Implements OffloadingManager               │
 │  Minimal state: just tracks job_id counter                  │
-│  Secondary tiers report completion via CompletedJob         │
+│  Secondary tiers report completion via JobResult            │
 └──────────────────────┬──────────────────────────────────────┘
                        │
          ┌─────────────┼─────────────┐
@@ -571,7 +595,7 @@ Scheduler          TieredManager       Primary          Secondary Tier
     │───────────────────>│                │                    │
     │                    │ get_finished() │                    │
     │                    │────────────────────────────────────>│
-    │                    │<─ CompletedJob (decrement ref_cnt)  │
+    │                    │<─ JobResult (decrement ref_cnt)  │
     │                    │ unprotect_blocks()│                 │
     │                    │───────────────>│                    │
     │                    │ prepare_store()│                    │
@@ -598,7 +622,7 @@ Scheduler          TieredManager       Primary          Secondary Tier
     │───────────────────>│                │                    │
     │                    │ get_finished() │                    │
     │                    │────────────────────────────────────>│
-    │                    │<─ CompletedJob(success=True)        │
+    │                    │<─ JobResult(success=True)        │
     │                    │ unprotect_blocks()│                 │
     │                    │───────────────>│ (ref_cnt--)        │
 ```
@@ -612,7 +636,8 @@ Scheduler          TieredManager       Primary          Secondary Tier
 | Secondary tier store method | `submit_store(job_id, ...)` — async, non-blocking | Keeps Scheduler process responsive; actual transfers happen asynchronously |
 | Secondary tier load method | `submit_load(job_id, ...)` — async, non-blocking | Consistent with store; enables parallel transfers |
 | Completion tracking | `get_finished()` polls for completed jobs | Decouples job submission from completion; supports multiple in-flight transfers |
-| `job_id` parameter | Required in `submit_store()` / `submit_load()` | Unique identifier returned by secondary tier in `CompletedJob` |
+| `job_id` parameter | Required in `submit_store()` / `submit_load()` | Unique identifier returned by secondary tier in `JobResult` |
+| Transfer direction | `TransferDirection` enum instead of boolean | More explicit and type-safe than `is_store` boolean flag |
 | Cascade timing | Happens in `complete_store()` after GPU→Primary completes | Ensures blocks are ready in primary before cascading to secondary tiers |
 | `prepare_store()` ordering | Call `get_finished()` first, then primary | Decrements ref_cnt before eviction decisions, enabling accurate capacity assessment |
 | `primary.protect_blocks()` in cascade | Called once per secondary tier in `complete_store()` | Gets transfer spec AND increments `ref_cnt` to protect blocks during async transfer |
@@ -644,7 +669,7 @@ kv_transfer_config = KVTransferConfig(
         "secondary_tiers": [  # Optional: list of secondary tier configs
             {
                 "type": "dummy",  # Tier type
-                "tier_name": "TestStorage",  # Optional: tier name
+                "tier_name": "TestStorage",  # Tier name
                 "max_blocks": 10000,  # Optional: max blocks
                 "simulate_async": False  # Optional: for dummy tier
             }
@@ -789,14 +814,14 @@ def _create_secondary_tier(self, tier_config: dict):
 ### 7.5 Implementation Status
 
 **Phase 1: Core Infrastructure** ✅ **COMPLETE**
-- ✅ Updated [`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:179) abstract class with `submit_store()`, `submit_load()`, `get_finished()` API returning `CompletedJob`
+- ✅ Updated [`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:274) abstract class with `submit_store()`, `submit_load()`, `get_finished()` API returning `JobResult`
 - ✅ Implemented [`TieredOffloadingManager`](vllm/v1/kv_offload/tiered_manager.py) with `_process_finished_jobs()`
 - ✅ `prepare_store()` calls `get_finished()` before `primary.prepare_store()`
 - ✅ Cascade calls `primary.protect_blocks()` once per secondary tier
 - ✅ Added tier-agnostic API methods to [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:82)
 
 **Phase 2: Dummy Secondary Tier** ✅ **COMPLETE**
-- ✅ Implemented [`DummySecondaryTier`](vllm/v1/kv_offload/dummy_secondary_tier.py) for testing
+- ✅ Implemented [`DummySecondaryTier`](vllm/v1/kv_offload/secondary_tiers/dummy.py) for testing
 - ✅ Added comprehensive unit tests in [`test_tiered_offloading.py`](tests/v1/kv_offload/test_tiered_offloading.py)
 - ✅ All 16 tests passing
 
@@ -822,8 +847,8 @@ def _create_secondary_tier(self, tier_config: dict):
 
 This design provides a comprehensive architecture for multi-tier KV cache offloading that:
 
-1. ✅ Maintains the existing [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:82) API contract
-2. ✅ Introduces [`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:179) with async `submit_store()` / `submit_load()` / `get_finished()` API returning `CompletedJob`
+1. ✅ Maintains the existing [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:97) API contract
+2. ✅ Introduces [`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:274) with async `submit_store()` / `submit_load()` / `get_finished()` API returning `JobResult`
 3. ✅ Implements [`TieredOffloadingManager`](vllm/v1/kv_offload/tiered_manager.py) with minimal state tracking
 4. ✅ Supports staged promotion (Secondary → Primary → GPU)
 5. ✅ Enables cascade offloading to ALL secondary tiers (GPU → Primary → All Secondaries)
@@ -840,10 +865,10 @@ This design provides a comprehensive architecture for multi-tier KV cache offloa
 - ⏳ **Phases 4-5 FUTURE WORK**: Storage backend and production integration
 
 **Key Files:**
-- [`vllm/v1/kv_offload/abstract.py`](vllm/v1/kv_offload/abstract.py) - Core abstractions (`SecondaryTierManager`, `CompletedJob`)
+- [`vllm/v1/kv_offload/abstract.py`](vllm/v1/kv_offload/abstract.py) - Core abstractions (`SecondaryTierManager`, `JobResult`, `TransferDirection`)
 - [`vllm/v1/kv_offload/tiered_manager.py`](vllm/v1/kv_offload/tiered_manager.py) - `TieredOffloadingManager` implementation
 - [`vllm/v1/kv_offload/tiered.py`](vllm/v1/kv_offload/tiered.py) - `TierOffloadingSpec` for configuration
-- [`vllm/v1/kv_offload/dummy_secondary_tier.py`](vllm/v1/kv_offload/dummy_secondary_tier.py) - Testing implementation
+- [`vllm/v1/kv_offload/secondary_tiers/dummy.py`](vllm/v1/kv_offload/secondary_tiers/dummy.py) - Testing implementation
 - [`vllm/v1/kv_offload/factory.py`](vllm/v1/kv_offload/factory.py) - Spec registration
 - [`tests/v1/kv_offload/test_tiered_offloading.py`](tests/v1/kv_offload/test_tiered_offloading.py) - Comprehensive tests (16/16 passing)
 

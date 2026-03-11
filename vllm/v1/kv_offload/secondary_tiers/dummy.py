@@ -23,6 +23,20 @@ from vllm.v1.kv_offload.abstract import (
 )
 
 
+class DummyLoadStoreSpec(LoadStoreSpec):
+    """
+    Minimal LoadStoreSpec for DummySecondaryTier testing.
+
+    This spec is never actually used for I/O since DummySecondaryTier
+    stores blocks in memory. It exists to provide proper type semantics
+    and serve as a template for real secondary tier implementations.
+    """
+
+    @staticmethod
+    def medium() -> str:
+        return "Dummy"
+
+
 class DummySecondaryTier(SecondaryTierManager):
     """
     A simple in-memory secondary tier for testing.
@@ -118,7 +132,7 @@ class DummySecondaryTier(SecondaryTierManager):
             # All blocks already present
             return PrepareStoreOutput(
                 block_hashes_to_store=[],
-                store_spec=primary_load_spec,  # Dummy spec
+                store_spec=DummyLoadStoreSpec(),
                 block_hashes_evicted=[],
             )
 
@@ -163,7 +177,7 @@ class DummySecondaryTier(SecondaryTierManager):
 
         return PrepareStoreOutput(
             block_hashes_to_store=blocks_to_store,
-            store_spec=primary_load_spec,  # Dummy spec
+            store_spec=DummyLoadStoreSpec(),
             block_hashes_evicted=evicted,
         )
 
@@ -210,7 +224,7 @@ class DummySecondaryTier(SecondaryTierManager):
             # Job completes immediately
             self._complete_load_job(completed)
 
-        return primary_store_spec  # Dummy spec
+        return DummyLoadStoreSpec()
 
     def get_finished(self) -> Iterable[JobResult]:
         """

@@ -16,8 +16,8 @@ import pytest
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import TransferDirection
 from vllm.v1.kv_offload.backends.cpu import CPUBackend
-from vllm.v1.kv_offload.dummy_secondary_tier import DummySecondaryTier
 from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
+from vllm.v1.kv_offload.secondary_tiers.dummy import DummySecondaryTier
 from vllm.v1.kv_offload.tiered_manager import TieredOffloadingManager
 
 
@@ -279,10 +279,17 @@ class TestTieredOffloadingManager:
         # Touch blocks
         self.manager.touch(blocks)
 
-        # Verify touch was called on all tiers (check LRU order)
+        # Verify touch was called on primary tier (check LRU order)
         # In LRU, touched blocks should be at the end
         primary_keys = list(self.primary_tier.blocks.keys())
         assert primary_keys[-3:] == list(reversed(blocks))
+
+        # Verify touch was called on all secondary tiers
+        secondary1_keys = list(self.secondary_tier1.blocks.keys())
+        assert secondary1_keys[-3:] == list(reversed(blocks))
+
+        secondary2_keys = list(self.secondary_tier2.blocks.keys())
+        assert secondary2_keys[-3:] == list(reversed(blocks))
 
     def test_failed_store_no_cascade(self):
         """Test that failed GPU→primary store doesn't cascade."""
