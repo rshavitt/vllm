@@ -29,20 +29,17 @@ The class provides the following primitives:
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
 from dataclasses import dataclass
-from enum import Enum
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 
 # Type alias for job IDs used in async transfer tracking
 JobId = int
-
-
-class TransferDirection(Enum):
-    """Direction of data transfer in the offloading system."""
-
-    PRIMARY_TO_SECONDARY = "primary_to_secondary"
-    SECONDARY_TO_PRIMARY = "secondary_to_primary"
 
 
 class LoadStoreSpec(ABC):
@@ -58,6 +55,10 @@ class LoadStoreSpec(ABC):
         Returns a string representation of the medium type
         this store/load targets.
         """
+        pass
+
+    def release(self) -> None:  # noqa: B027
+        """Release any resources held by this spec (e.g. open buffer exports)."""
         pass
 
 
@@ -89,9 +90,16 @@ class JobResult:
     """Result of an async transfer job (successful or failed)."""
 
     job_id: JobId
-    block_hashes: list[BlockHash]
-    direction: TransferDirection
     success: bool
+
+
+@dataclass
+class JobMetadata:
+    """Metadata for an in-flight async transfer job."""
+
+    job_id: JobId
+    block_hashes: list[BlockHash]
+    spec: LoadStoreSpec
 
 
 class OffloadingManager(ABC):
@@ -190,21 +198,23 @@ class OffloadingManager(ABC):
         """
         return ()
 
-    # PRNOTE: Tier-agnostic API for primary tier operations
-    # These wrapper methods provide intent-based names for tiered manager operations:
-    #
-    # - allocate_blocks()/finalize_blocks() wrap prepare_store()/complete_store()
-    #   for promotion flows (secondary→primary)
-    #
-    # - protect_blocks()/unprotect_blocks() wrap prepare_load()/complete_load()
-    #   for cascade flows (primary→secondary)
-    #
-    # This makes tiered manager code self-documenting and avoids confusing patterns
-    # like calling `primary.prepare_load()` during Store operations.
 
-    # Tier-agnostic API for primary tier operations
-    # These methods provide intent-based names that work regardless of
-    # data flow direction, making tiered manager code self-documenting.
+class PrimaryTierManager(OffloadingManager):
+    """
+    Abstract base class for primary tier managers.
+
+    Combines OffloadingManager (core interface) with tier-agnostic alias
+    methods that make TieredOffloadingManager code self-documenting.
+
+    Usage in TieredOffloadingManager:
+    - allocate_blocks()/finalize_blocks() wrap prepare_store()/complete_store()
+      for promotion flows (secondary→primary)
+    - protect_blocks()/unprotect_blocks() wrap prepare_load()/complete_load()
+      for cascade flows (primary→secondary)
+
+    This avoids confusing patterns like calling `primary.prepare_load()` during
+    Store operations, making the code intent clear.
+    """
 
     def allocate_blocks(
         self, block_hashes: Iterable[BlockHash]
@@ -270,6 +280,24 @@ class OffloadingManager(ABC):
         """
         self.complete_load(block_hashes)
 
+    def get_primary_kv_tensors(self) -> list["torch.Tensor"]:
+        """
+        Get the primary tier's KV cache tensors.
+
+        Returns the list of CPU tensors that store the KV cache data.
+        TieredManager will pass memoryviews of these tensors to secondary tier managers
+        for data transfer operations.
+
+        TODO: This is a placeholder returning an empty list.
+        Actual implementation requires CPUBackend to maintain reference
+        to worker's CPU tensors.
+
+        Returns:
+            List of CPU tensors storing KV cache data. Currently returns
+            empty list as placeholder.
+        """
+        return []  # Placeholder - to be implemented
+
 
 class SecondaryTierManager(ABC):
     """
@@ -305,12 +333,7 @@ class SecondaryTierManager(ABC):
         pass
 
     @abstractmethod
-    def submit_store(
-        self,
-        job_id: JobId,
-        block_hashes: Iterable[BlockHash],
-        primary_load_spec: LoadStoreSpec,
-    ) -> PrepareStoreOutput | None:
+    def submit_store(self, job_metadata: JobMetadata) -> None:
         """
         Submit an async job to store blocks from the primary tier to this
         secondary tier.
@@ -320,7 +343,7 @@ class SecondaryTierManager(ABC):
         calling thread.
 
         The caller (TieredOffloadingManager) must have already called
-        primary.protect_blocks(block_hashes) to obtain primary_load_spec and
+        primary.protect_blocks(block_hashes) to obtain job_metadata.spec and
         to increment ref_cnt on those blocks. ref_cnt will be decremented
         when get_finished() reports this job_id as complete and
         primary.unprotect_blocks() is called.
@@ -333,24 +356,15 @@ class SecondaryTierManager(ABC):
           4. Submitting the async transfer: primary → secondary
 
         Args:
-            job_id: Unique identifier for this transfer job.
-            block_hashes: Blocks to store.
-            primary_load_spec: Spec for reading blocks from the primary tier
-                               (obtained via primary.protect_blocks()).
-
-        Returns:
-            PrepareStoreOutput describing which blocks will be stored and
-            what was evicted, or None if the store cannot proceed.
+            job_metadata: Job metadata including job_id, block_hashes, and
+                          spec for reading blocks from the primary tier
+                          (obtained via primary.protect_blocks()).
+                          spec should be CPUMemoryViewLoadStoreSpec.
         """
         pass
 
     @abstractmethod
-    def submit_load(
-        self,
-        job_id: JobId,
-        block_hashes: Iterable[BlockHash],
-        primary_store_spec: LoadStoreSpec,
-    ) -> LoadStoreSpec | None:
+    def submit_load(self, job_metadata: JobMetadata) -> None:
         """
         Submit an async job to load blocks from this secondary tier to the
         primary tier.
@@ -360,20 +374,16 @@ class SecondaryTierManager(ABC):
         the calling thread.
 
         The caller (TieredOffloadingManager) must have already called
-        primary.allocate_blocks(block_hashes) to obtain primary_store_spec and
+        primary.allocate_blocks(block_hashes) to obtain job_metadata.spec and
         to allocate space in the primary tier. When get_finished() reports
         this job_id as complete, primary.finalize_blocks() is called to make
         the blocks available for GPU loads.
 
         Args:
-            job_id: Unique identifier for this transfer job.
-            block_hashes: Blocks to load.
-            primary_store_spec: Spec for writing blocks into the primary tier
-                                (obtained via primary.allocate_blocks()).
-
-        Returns:
-            LoadStoreSpec for reading from this secondary tier, or None if
-            the load cannot proceed.
+            job_metadata: Job metadata including job_id, block_hashes, and
+                          spec for writing blocks into the primary tier
+                          (obtained via primary.allocate_blocks()).
+                          spec should be CPUMemoryViewLoadStoreSpec.
         """
         pass
 

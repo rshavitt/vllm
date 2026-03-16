@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This document presents a comprehensive design for extending vLLM's KV cache offloading system from single-tier (GPU ↔ primary tier) to multi-tier (GPU ↔ primary tier ↔ secondary tiers). The primary tier is currently implemented using CPU memory. The design maintains backward compatibility with the existing [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:159) API while introducing new abstractions for secondary tiers.
+This document presents a comprehensive design for extending vLLM's KV cache offloading system from single-tier (GPU ↔ primary tier) to multi-tier (GPU ↔ primary tier ↔ secondary tiers). The primary tier is currently implemented using CPU memory. The design maintains backward compatibility with the existing [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:105) API while introducing new abstractions for secondary tiers.
 
 ## Terminology: Primary Tier vs CPU
 
@@ -22,7 +22,7 @@ When we refer to "CPU" in this document, we are discussing the specific implemen
 5. **Lightweight Scheduler methods** — All `SecondaryTierManager` methods run in the Scheduler process and must be non-blocking; actual data transfers are submitted asynchronously via `submit_load()` / `submit_store()`
 6. **`ref_cnt` as eviction protection** — `primary.protect_blocks()` increments `ref_cnt`, protecting blocks from eviction until `unprotect_blocks()` is called
 7. **Secondary tiers own their evictions** — Each secondary tier is responsible for managing its own eviction policy
-8. **Tier-agnostic API** — Primary tier provides intent-based methods (`protect_blocks()`, `unprotect_blocks()`, `allocate_blocks()`, `finalize_blocks()`) that work regardless of data flow direction
+8. **Tier-agnostic API** — `PrimaryTierManager` provides intent-based methods (`protect_blocks()`, `unprotect_blocks()`, `allocate_blocks()`, `finalize_blocks()`) that work regardless of data flow direction
 
 ---
 
@@ -31,15 +31,23 @@ When we refer to "CPU" in this document, we are discussing the specific implemen
 ### 1.1 Existing Components
 
 **Core Abstractions:**
-- [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:159) — Scheduler-side interface for managing offloaded blocks
+- [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:105) — Scheduler-side interface for managing offloaded blocks
+- [`PrimaryTierManager`](vllm/v1/kv_offload/abstract.py:202) — Extends `OffloadingManager` with tier-agnostic alias methods (`protect_blocks()`, `unprotect_blocks()`, `allocate_blocks()`, `finalize_blocks()`, `get_primary_kv_tensors()`)
 - [`Backend`](vllm/v1/kv_offload/backend.py:37) — Allocates storage and provides load/store specs
-- [`LoadStoreSpec`](vllm/v1/kv_offload/abstract.py:37) — Worker-side metadata for actual data transfer
+- [`LoadStoreSpec`](vllm/v1/kv_offload/abstract.py:45) — Worker-side metadata for actual data transfer
 - [`BlockStatus`](vllm/v1/kv_offload/backend.py:11) — Tracks block state (ready/not-ready, ref count)
-- [`PrepareStoreOutput`](vllm/v1/kv_offload/abstract.py:53) — Output of `prepare_store()`: blocks to store, store spec, evicted blocks
+- [`PrepareStoreOutput`](vllm/v1/kv_offload/abstract.py:65) — Output of `prepare_store()`: blocks to store, store spec, evicted blocks
+- [`JobResult`](vllm/v1/kv_offload/abstract.py:88) — Result of a completed async job (`job_id`, `success`)
+- [`JobMetadata`](vllm/v1/kv_offload/abstract.py:96) — Metadata for an in-flight job (`job_id`, `block_hashes`, `spec`)
+
+**Medium Types** ([`mediums.py`](vllm/v1/kv_offload/mediums.py)):
+- `GPULoadStoreSpec` — GPU memory spec
+- `CPULoadStoreSpec` / `BlockIDsLoadStoreSpec` — CPU memory spec with block IDs
+- `CPUMemoryViewLoadStoreSpec` — CPU memory spec with block IDs **and memory views** (used when passing data to secondary tiers)
 
 **Existing Implementations:**
-- [`LRUOffloadingManager`](vllm/v1/kv_offload/lru_manager.py:16) — LRU eviction policy
-- [`ARCOffloadingManager`](vllm/v1/kv_offload/arc_manager.py:16) — Adaptive Replacement Cache policy
+- [`LRUOffloadingManager`](vllm/v1/kv_offload/lru_manager.py:16) — LRU eviction policy (implements `PrimaryTierManager`)
+- [`ARCOffloadingManager`](vllm/v1/kv_offload/arc_manager.py:16) — Adaptive Replacement Cache policy (implements `PrimaryTierManager`)
 - [`CPUBackend`](vllm/v1/kv_offload/backends/cpu.py:20) — CPU memory backend
 
 **Current Data Flow:**
@@ -52,20 +60,21 @@ GPU ←→ primary tier (via OffloadingManager + CPUBackend)
 
 The [`BlockStatus`](vllm/v1/kv_offload/backend.py:11) in the primary tier tracks a `ref_cnt` for each block. This counter is the primary protection against eviction:
 
-- **Incremented** by [`protect_blocks()`](vllm/v1/kv_offload/abstract.py:178) (or `prepare_load()`) — protects a block from being evicted while it is being read or while it is the source for a secondary-tier store
-- **Decremented** by [`unprotect_blocks()`](vllm/v1/kv_offload/abstract.py:204) (or `complete_load()`) — releases the protection, allowing the block to be evicted again
+- **Incremented** by [`protect_blocks()`](vllm/v1/kv_offload/abstract.py:252) (or `prepare_load()`) — protects a block from being evicted while it is being read or while it is the source for a secondary-tier store
+- **Decremented** by [`unprotect_blocks()`](vllm/v1/kv_offload/abstract.py:269) (or `complete_load()`) — releases the protection, allowing the block to be evicted again
 
-This mechanism is critical for the tiered design: when cascading a block from the primary tier to a secondary tier, `protect_blocks()` must be called on the primary tier to pin the block in primary tier memory for the duration of the transfer. `unprotect_blocks()` is called (via `get_finished()`) once the async transfer completes.
+This mechanism is critical for the tiered design: when cascading a block from the primary tier to a secondary tier, `protect_blocks()` must be called on the primary tier to pin the block in primary tier memory for the duration of the transfer. `unprotect_blocks()` is called once the async transfer completes (via `_process_finished_jobs()`).
 
-**Tier-Agnostic API:** The primary tier provides intent-based methods that make the code self-documenting:
+**Tier-Agnostic API:** The [`PrimaryTierManager`](vllm/v1/kv_offload/abstract.py:202) provides intent-based methods that make the code self-documenting:
 - `protect_blocks()` / `unprotect_blocks()` — for ref_cnt management during async operations
 - `allocate_blocks()` / `finalize_blocks()` — for space allocation (aliases for `prepare_store()` / `complete_store()`)
+- `get_primary_kv_tensors()` — returns the list of CPU tensors for direct memory access by secondary tiers
 
 ### 1.3 Extension Points
 
 The architecture can be extended at two levels:
 
-1. **Manager Level** — Create `TieredOffloadingManager` implementing [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:159)
+1. **Manager Level** — Create `TieredOffloadingManager` implementing [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:105)
 2. **Secondary Tier Level** — Create `SecondaryTierManager` implementations (Storage, Network, etc.)
 
 ---
@@ -74,17 +83,45 @@ The architecture can be extended at two levels:
 
 ### 2.1 Overview
 
-[`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:69) is an abstract class for managing non-primary tiers. Unlike [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:159), it cannot directly access GPU memory and must coordinate with the primary tier (currently CPU-based).
+[`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:302) is an abstract class for managing non-primary tiers. Unlike [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:105), it cannot directly access GPU memory and must coordinate with the primary tier (currently CPU-based).
 
-**Critical constraint:** All `SecondaryTierManager` methods are called from the **Scheduler process** and must be **lightweight and non-blocking**. They must not perform actual data transfers on the calling thread. Instead, `submit_load()` and `submit_store()` accept a `job_id` parameter and submit async jobs for tracking.
+**Critical constraint:** All `SecondaryTierManager` methods are called from the **Scheduler process** and must be **lightweight and non-blocking**. They must not perform actual data transfers on the calling thread. Instead, `submit_load()` and `submit_store()` accept a `JobMetadata` parameter and submit async jobs for tracking.
 
-### 2.2 Relationship Between `submit_store()` and `primary.protect_blocks()`
+### 2.2 The `JobMetadata` Contract
+
+All job submissions use [`JobMetadata`](vllm/v1/kv_offload/abstract.py:96):
+
+```python
+@dataclass
+class JobMetadata:
+    """Metadata for an in-flight async transfer job."""
+    job_id: JobId
+    block_hashes: list[BlockHash]
+    spec: LoadStoreSpec  # Always CPUMemoryViewLoadStoreSpec for secondary tiers
+```
+
+The `spec` field is always a `CPUMemoryViewLoadStoreSpec` (see [mediums.py](vllm/v1/kv_offload/mediums.py)), which carries both block IDs and memory views for direct CPU memory access. This conversion from `BlockIDsLoadStoreSpec` → `CPUMemoryViewLoadStoreSpec` is performed by `TieredOffloadingManager._create_memory_view_spec()` before calling `submit_store()` or `submit_load()`.
+
+When a job completes, `get_finished()` returns [`JobResult`](vllm/v1/kv_offload/abstract.py:88):
+
+```python
+@dataclass
+class JobResult:
+    """Result of an async transfer job (successful or failed)."""
+    job_id: JobId
+    success: bool
+```
+
+`TieredOffloadingManager` determines whether a completed job was a store or load by checking `job_id` against its `_store_jobs` and `_load_jobs` dictionaries. The `JobResult` itself does not carry direction information.
+
+### 2.3 Relationship Between `submit_store()` and `primary.protect_blocks()`
 
 When the `TieredOffloadingManager` cascades a block from the primary tier to a secondary tier:
 
-1. **`primary.protect_blocks(block_hashes)`** is called to obtain the [`LoadStoreSpec`](vllm/v1/kv_offload/abstract.py:37) describing where the blocks live in primary tier memory. This also **increments `ref_cnt`** on those blocks, protecting them from eviction for the duration of the transfer.
-2. **`secondary.submit_store(job_id, block_hashes, primary_load_spec)`** is called with the spec obtained above, submitting an async transfer job.
-3. When `get_finished()` reports the job as complete, **`primary.unprotect_blocks(block_hashes)`** is called to **decrement `ref_cnt`**, releasing the eviction protection.
+1. **`primary.protect_blocks(block_hashes)`** is called to obtain a `BlockIDsLoadStoreSpec` describing where the blocks live in primary tier memory. This also **increments `ref_cnt`** on those blocks, protecting them from eviction for the duration of the transfer.
+2. The spec is converted to `CPUMemoryViewLoadStoreSpec` via `_create_memory_view_spec()`, then bundled into a `JobMetadata`.
+3. **`secondary.submit_store(job_metadata)`** is called, submitting an async transfer job.
+4. When `get_finished()` reports the job as complete, `job_metadata.spec.release()` is called to free memory views, then **`primary.unprotect_blocks(block_hashes)`** is called to **decrement `ref_cnt`**, releasing the eviction protection.
 
 The tier-agnostic API makes the intent clear:
 - **`protect_blocks()`**: Explicitly states we're protecting blocks from eviction (internally calls `prepare_load()`)
@@ -92,30 +129,19 @@ The tier-agnostic API makes the intent clear:
 
 When there are multiple secondary tiers, `primary.protect_blocks()` must be called **once per secondary tier** to correctly increment `ref_cnt` for each pending transfer.
 
-### 2.3 API Definition
+### 2.4 API Definition
 
 ```python
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import Enum
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.kv_offload.abstract import LoadStoreSpec, PrepareStoreOutput
+from vllm.v1.kv_offload.abstract import JobId, JobMetadata, JobResult, LoadStoreSpec
 
-JobId = int
+# JobId = int (type alias)
 
-class TransferDirection(Enum):
-    """Direction of data transfer in the offloading system."""
-    PRIMARY_TO_SECONDARY = "primary_to_secondary"
-    SECONDARY_TO_PRIMARY = "secondary_to_primary"
-
-@dataclass
-class JobResult:
-    """Result of a completed async transfer job."""
-    job_id: JobId
-    block_hashes: list[BlockHash]
-    direction: TransferDirection  # Direction of transfer
-    success: bool
+# JobResult has: job_id: JobId, success: bool
+# JobMetadata has: job_id: JobId, block_hashes: list[BlockHash], spec: LoadStoreSpec
 
 
 class SecondaryTierManager(ABC):
@@ -147,75 +173,33 @@ class SecondaryTierManager(ABC):
         pass
 
     @abstractmethod
-    def submit_store(
-        self,
-        job_id: JobId,
-        block_hashes: Iterable[BlockHash],
-        primary_load_spec: LoadStoreSpec,
-    ) -> PrepareStoreOutput | None:
+    def submit_store(self, job_metadata: JobMetadata) -> None:
         """
         Submit an async job to store blocks from the primary tier to this
         secondary tier.
 
-        This method is lightweight: it allocates metadata and submits the
-        transfer job, but does NOT perform the actual data transfer on the
-        calling thread.
-
-        The caller (TieredOffloadingManager) must have already called
-        primary.protect_blocks(block_hashes) to obtain primary_load_spec and
-        to increment ref_cnt on those blocks. ref_cnt will be decremented
-        when get_finished() reports this job_id as complete and
-        primary.unprotect_blocks() is called.
+        job_metadata.spec is always CPUMemoryViewLoadStoreSpec (obtained via
+        primary.protect_blocks() then _create_memory_view_spec()).
 
         This method is responsible for:
           1. Filtering out blocks already present in this secondary tier
-          2. Evicting blocks from this secondary tier if needed (secondary
-             tiers are responsible for their own evictions)
+          2. Evicting blocks from this secondary tier if needed
           3. Allocating space in this secondary tier
           4. Submitting the async transfer: primary → secondary
-
-        Args:
-            job_id: Unique identifier for this transfer job.
-            block_hashes: Blocks to store.
-            primary_load_spec: Spec for reading blocks from the primary tier
-                               (obtained via primary.protect_blocks()).
-
-        Returns:
-            PrepareStoreOutput describing which blocks will be stored and
-            what was evicted, or None if the store cannot proceed.
         """
         pass
 
     @abstractmethod
-    def submit_load(
-        self,
-        job_id: JobId,
-        block_hashes: Iterable[BlockHash],
-        primary_store_spec: LoadStoreSpec,
-    ) -> LoadStoreSpec | None:
+    def submit_load(self, job_metadata: JobMetadata) -> None:
         """
         Submit an async job to load blocks from this secondary tier to the
         primary tier.
 
-        This method is lightweight: it marks blocks as in-flight and submits
-        the transfer job, but does NOT perform the actual data transfer on
-        the calling thread.
+        job_metadata.spec is always CPUMemoryViewLoadStoreSpec (obtained via
+        primary.allocate_blocks() then _create_memory_view_spec()).
 
-        The caller (TieredOffloadingManager) must have already called
-        primary.allocate_blocks(block_hashes) to obtain primary_store_spec and
-        to allocate space in the primary tier. When get_finished() reports
-        this job_id as complete, primary.finalize_blocks() is called to make
-        the blocks available for GPU loads.
-
-        Args:
-            job_id: Unique identifier for this transfer job.
-            block_hashes: Blocks to load.
-            primary_store_spec: Spec for writing blocks into the primary tier
-                                (obtained via primary.allocate_blocks()).
-
-        Returns:
-            LoadStoreSpec for reading from this secondary tier, or None if
-            the load cannot proceed.
+        When get_finished() reports this job_id as complete,
+        primary.finalize_blocks() is called to make the blocks available for GPU loads.
         """
         pass
 
@@ -224,10 +208,8 @@ class SecondaryTierManager(ABC):
         """
         Poll for completed async jobs (both loads and stores).
 
-        This is the mechanism by which the TieredOffloadingManager learns
-        that a transfer has completed and can:
-          - Call primary.unprotect_blocks() to decrement ref_cnt (for stores)
-          - Call primary.finalize_blocks() to make blocks loadable (for loads)
+        Returns JobResult with only job_id and success. TieredOffloadingManager
+        determines job direction by looking up job_id in _store_jobs / _load_jobs.
 
         Returns:
             Iterable of JobResult objects for all jobs that have
@@ -236,45 +218,38 @@ class SecondaryTierManager(ABC):
         pass
 
     def touch(self, block_hashes: Iterable[BlockHash]):
-        """
-        Mark blocks as recently used for eviction policy.
-
-        Args:
-            block_hashes: Blocks to mark as recently used.
-        """
+        """Mark blocks as recently used for eviction policy."""
         return
 
     @abstractmethod
     def get_tier_name(self) -> str:
-        """
-        Get the name of this tier (e.g., "Storage", "Network").
-
-        Returns:
-            Tier name string.
-        """
+        """Get the name of this tier (e.g., "Storage", "Network")."""
         pass
 ```
 
-### 2.4 Key Design Decisions
+### 2.5 Key Design Decisions
 
 **Why `submit_` prefix instead of `load`/`store`?**
 - Makes it explicit that the operation is asynchronous and non-blocking
 - Distinguishes the submission step from the completion step (`get_finished()`)
-- Consistent with the pattern used in [`OffloadingWorker.transfer_async()`](vllm/v1/kv_offload/worker/worker.py)
 
-**Why pass `job_id` into `submit_store()` / `submit_load()`?**
-- Provides a unique identifier for tracking async jobs
-- Secondary tier returns this `job_id` in `get_finished()` along with the block_hashes
-- Enables correlation between job submission and completion
-- Mirrors the pattern in [`OffloadingConnectorWorker`](vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py:558)
+**Why pass `JobMetadata` instead of separate `(job_id, block_hashes, spec)` params?**
+- Groups related data into a single, reusable object
+- `TieredOffloadingManager` stores `JobMetadata` in `_store_jobs`/`_load_jobs` for later lookup when `get_finished()` reports completion
+- Mirrors the pattern in [`OffloadingConnectorWorker`](vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py)
 
-**Why does `submit_store()` receive `primary_load_spec`?**
-- The spec is obtained by calling `primary.protect_blocks()`, which also increments `ref_cnt`
-- Passing it in makes the contract explicit: the caller is responsible for pinning the blocks before submitting the store
+**Why does `JobResult` not carry `block_hashes` or direction?**
+- `TieredOffloadingManager` already stores `JobMetadata` (with `block_hashes`) in `_store_jobs`/`_load_jobs`
+- Direction is determined by which dict contains the `job_id`
+- Avoids duplicating data between `JobResult` and `JobMetadata`
+
+**Why `CPUMemoryViewLoadStoreSpec` for secondary tiers?**
+- Secondary tiers need direct memory access to read/write CPU buffers
+- `BlockIDsLoadStoreSpec` (returned by `protect_blocks()`) only has block IDs; memory views are needed for the actual copy
+- `_create_memory_view_spec()` in `TieredOffloadingManager` performs this conversion before calling `submit_store`/`submit_load`
 
 **Why are secondary tiers responsible for their own evictions?**
 - Each secondary tier has its own capacity and eviction policy
-- The primary tier does not need to know about secondary tier capacity
 - Simplifies the coordination logic in `TieredOffloadingManager`
 
 ---
@@ -284,18 +259,12 @@ class SecondaryTierManager(ABC):
 ### 3.1 Class Structure
 
 ```python
-from collections.abc import Iterable
-from enum import Enum
-from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
-    OffloadingManager,
-    LoadStoreSpec,
-    PrepareStoreOutput,
-    OffloadingEvent,
-    SecondaryTierManager,
+    JobId, JobMetadata, LoadStoreSpec, OffloadingEvent,
+    OffloadingManager, PrepareStoreOutput,
+    PrimaryTierManager, SecondaryTierManager,
 )
-
-JobId = int
+from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec, CPUMemoryViewLoadStoreSpec
 
 
 class TieredOffloadingManager(OffloadingManager):
@@ -307,36 +276,55 @@ class TieredOffloadingManager(OffloadingManager):
     provide hierarchical KV cache offloading.
 
     Key internal state:
-      - Minimal state tracking; relies on secondary tiers to report completion via get_finished()
-      - Secondary tiers return JobResult objects containing all necessary information
-      - job_id_counter: monotonically increasing counter for job IDs
+      - _store_jobs: dict[JobId, JobMetadata] — in-flight primary→secondary jobs
+      - _load_jobs:  dict[JobId, JobMetadata] — in-flight secondary→primary jobs
+      - _job_id_counter: monotonically increasing counter for job IDs
     """
 
     def __init__(
         self,
-        primary_tier: OffloadingManager,
+        primary_tier: PrimaryTierManager,   # Must be PrimaryTierManager, not OffloadingManager
         secondary_tiers: list[SecondaryTierManager] | None = None,
         enable_events: bool = False,
     ):
-        self.primary_tier = primary_tier
+        self.primary_tier: PrimaryTierManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
-        
+
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
 
-    def _next_job_id(self) -> JobId:
-        job_id = self._job_id_counter
-        self._job_id_counter += 1
-        return job_id
+        # Job tracking dicts — used by _process_finished_jobs() to look up
+        # block_hashes and determine direction when get_finished() fires
+        self._store_jobs: dict[JobId, JobMetadata] = {}  # primary→secondary
+        self._load_jobs:  dict[JobId, JobMetadata] = {}  # secondary→primary
+
+    def _next_job_id(self) -> JobId: ...
+
+    def _create_memory_view_spec(
+        self, cpu_blocks_spec: LoadStoreSpec, readonly: bool = False
+    ) -> CPUMemoryViewLoadStoreSpec:
+        """
+        Convert BlockIDsLoadStoreSpec → CPUMemoryViewLoadStoreSpec.
+
+        Takes block IDs from the primary-tier spec and enhances them with
+        memory views (obtained via primary_tier.get_primary_kv_tensors())
+        so secondary tiers can do direct CPU memory copies.
+        """
+        assert isinstance(cpu_blocks_spec, BlockIDsLoadStoreSpec)
+        cpu_tensors = self.primary_tier.get_primary_kv_tensors()
+        return CPUMemoryViewLoadStoreSpec(
+            block_ids=cpu_blocks_spec.block_ids.tolist(),
+            cpu_tensors=cpu_tensors,
+            readonly=readonly,
+        )
 ```
 
 ### 3.2 `prepare_store()` and the `get_finished()` Call
 
-A critical design point: **`prepare_store()` must call `get_finished()` on all secondary tiers before calling `primary.prepare_store()`**. This ensures that:
+A critical design point: **`prepare_store()` must call `_process_finished_jobs()` before calling `primary.prepare_store()`**. This ensures that:
 
 1. Any previously completed async transfers have their `ref_cnt` decremented (via `primary.unprotect_blocks()`)
-2. Blocks that have been successfully cascaded to secondary tiers are marked as `BOTH`
-3. The primary tier has the most up-to-date view of which blocks are pinned, enabling accurate eviction decisions
+2. The primary tier has the most up-to-date view of which blocks are pinned, enabling accurate eviction decisions
 
 ```python
 def prepare_store(
@@ -349,67 +337,75 @@ def prepare_store(
 
     # Step 2: Store to primary tier
     primary_result = self.primary_tier.prepare_store(block_hashes)
-    if primary_result is None:
-        return None
 
     # Note: Secondary tier cascading will happen in complete_store()
     # after the GPU→Primary transfer completes and blocks are ready.
-    
+
     return primary_result
 ```
 
 ### 3.3 `complete_store()` and Secondary Tier Cascading
 
-`complete_store()` is called by the connector when the GPU→Primary transfer finishes. At this point, the blocks are available in the primary tier and ready to be cascaded to secondary tiers.
-
-**This is where secondary tier cascading happens** — after blocks are confirmed to be in the primary tier.
+`complete_store()` is called by the connector when the GPU→Primary transfer finishes. This is where secondary tier cascading happens — after blocks are confirmed to be in the primary tier.
 
 ```python
-def complete_store(
-    self, block_hashes: Iterable[BlockHash], success: bool = True
-):
-    # Step 1: Complete store in primary tier (makes blocks loadable from primary)
-    self.primary_tier.complete_store(block_hashes, success)
-    
+def complete_store(self, block_hashes: Iterable[BlockHash], success: bool = True):
+    # Materialize only if success=True (needed for cascading)
+    block_hashes_list = list(block_hashes) if success else block_hashes
+
+    # Step 1: Complete store in primary tier (makes blocks loadable)
+    self.primary_tier.complete_store(block_hashes_list, success)
+
     if not success:
-        # If GPU→Primary transfer failed, don't cascade to secondary tiers
         return
-    
+
     # Step 2: Cascade to ALL secondary tiers
-    # For each secondary tier, call primary.protect_blocks() to get the
-    # LoadStoreSpec AND to increment ref_cnt (protecting blocks from eviction
-    # during the async transfer). One protect_blocks() call per secondary tier.
-    for tier_idx, tier in enumerate(self.secondary_tiers):
-        primary_load_spec = self.primary_tier.protect_blocks(block_hashes)
+    for tier in self.secondary_tiers:
+        # Get spec for reading from primary AND increment ref_cnt
+        primary_blocks_spec = self.primary_tier.protect_blocks(block_hashes_list)
+
+        # Convert to CPUMemoryViewLoadStoreSpec (readonly — secondary reads from primary)
+        primary_read_spec = self._create_memory_view_spec(primary_blocks_spec, readonly=True)
+
         job_id = self._next_job_id()
-        result = tier.submit_store(
-            job_id,
-            block_hashes,
-            primary_load_spec
+        job_metadata = JobMetadata(
+            job_id=job_id, block_hashes=block_hashes_list, spec=primary_read_spec
         )
-    
-    # Note: The async transfers are now in flight.
-    # Their completion is tracked via get_finished() / _process_finished_jobs().
+        self._store_jobs[job_id] = job_metadata
+
+        tier.submit_store(job_metadata)
+
+    # Async transfers are now in-flight; tracked via _process_finished_jobs()
 ```
 
 ### 3.4 `_process_finished_jobs()` — The Completion Handler
 
-This method polls all secondary tiers for completed jobs and updates state accordingly:
+This method polls all secondary tiers for completed jobs and updates state. Direction is determined by checking `_store_jobs` vs `_load_jobs`:
 
 ```python
 def _process_finished_jobs(self):
     for tier in self.secondary_tiers:
         for completed_job in tier.get_finished():
-            if completed_job.direction == TransferDirection.PRIMARY_TO_SECONDARY:
+            job_id = completed_job.job_id
+
+            if job_id in self._store_jobs:
                 # primary→secondary transfer completed.
-                # Decrement ref_cnt on primary blocks.
-                self.primary_tier.unprotect_blocks(completed_job.block_hashes)
-            else:
-                # secondary→primary transfer (promotion) completed.
-                # Make blocks available in primary tier.
+                # Release memory views, then decrement ref_cnt.
+                job_metadata = self._store_jobs.pop(job_id)
+                job_metadata.spec.release()
+                self.primary_tier.unprotect_blocks(job_metadata.block_hashes)
+
+            elif job_id in self._load_jobs:
+                # secondary→primary promotion completed.
+                # Release memory views, then make blocks available.
+                job_metadata = self._load_jobs.pop(job_id)
+                job_metadata.spec.release()
                 self.primary_tier.finalize_blocks(
-                    completed_job.block_hashes, completed_job.success
+                    job_metadata.block_hashes, completed_job.success
                 )
+
+            else:
+                raise ValueError(f"Unknown job_id {job_id}")
 ```
 
 ---
@@ -420,40 +416,35 @@ def _process_finished_jobs(self):
 
 **Algorithm:**
 
-1. **Primary Tier Check**
+1. **Process finished jobs first** — ensures promoted blocks are finalized
+2. **Primary Tier Check**
    ```python
    primary_hits = self.primary_tier.lookup(block_hashes)
    if primary_hits == len(block_hashes):
        return primary_hits  # All blocks in primary, done
    ```
 
-2. **Transfer Check**
+3. **Secondary Tier Check** (iterates through all tiers for remaining blocks)
    ```python
-   # Check if any remaining blocks are in-flight
-   # Note: We rely on the secondary tier's lookup() returning None for in-flight blocks
-   # This avoids the need to track in-flight state in TieredOffloadingManager
-   ```
-
-3. **Secondary Tier Check** (iterates through all tiers)
-   ```python
-   # Track whether any promotions were initiated
+   remaining_blocks = block_hashes_list[primary_hits:]
    has_promotions = False
-   
+
    for tier in self.secondary_tiers:
        if not remaining_blocks:
            break
-       
+
        secondary_hits = tier.lookup(remaining_blocks)
-       
-       if secondary_hits and secondary_hits > 0:
-           # Found blocks in this tier, initiate promotion
-           blocks_to_promote = remaining_blocks[:secondary_hits]
-           self._initiate_promotion(tier, blocks_to_promote)
-           has_promotions = True
-           
-           # Update remaining_blocks to continue searching
-           remaining_blocks = remaining_blocks[secondary_hits:]
-   
+
+       # Skip if tier is busy (None) or has no hits (0)
+       if not secondary_hits:
+           continue
+
+       # Found blocks — initiate promotion
+       blocks_to_promote = remaining_blocks[:secondary_hits]
+       self._initiate_promotion(tier, blocks_to_promote)
+       has_promotions = True
+       remaining_blocks = remaining_blocks[secondary_hits:]
+
    if has_promotions:
        return None  # Promotion initiated, retry later
    ```
@@ -463,28 +454,36 @@ def _process_finished_jobs(self):
    return primary_hits  # No more blocks found
    ```
 
+> **Note:** `lookup()` returning `None` from a secondary tier is treated as "not found" (skipped). This could theoretically cause redundant promotions if the same blocks are in-flight to multiple tiers simultaneously. This is a known open issue documented in the codebase.
+
 ### 4.2 Store Flow (Cascade to ALL Tiers)
 
 ```
 Scheduler calls prepare_store(block_hashes)
     │
     ├─ 1. _process_finished_jobs()          ← poll secondary tiers first
-    │       └─ unprotect_blocks() on primary ← decrement ref_cnt
+    │       └─ spec.release() + unprotect_blocks() on primary ← decrement ref_cnt
     │
     ├─ 2. primary.prepare_store()           ← allocate primary tier space, evict if needed
     │
-    └─ 3. For EACH secondary tier:
-            ├─ primary.protect_blocks()     ← get LoadStoreSpec + increment ref_cnt
-            └─ tier.submit_store(job_id, ..., primary_load_spec)
-                    └─ async: primary → secondary
-    
+    └─ returns PrepareStoreOutput to Scheduler
+
     Worker executes GPU → primary transfer (using primary store_spec)
 
 Scheduler calls complete_store(block_hashes)
-    └─ primary.complete_store()             ← blocks now loadable from primary
+    │
+    ├─ 1. primary.complete_store()          ← blocks now loadable from primary
+    │
+    └─ 2. For EACH secondary tier:
+            ├─ primary.protect_blocks()     ← get BlockIDsLoadStoreSpec + increment ref_cnt
+            ├─ _create_memory_view_spec()   ← convert to CPUMemoryViewLoadStoreSpec
+            ├─ record job_metadata in _store_jobs
+            └─ tier.submit_store(job_metadata)
+                    └─ async: primary → secondary
 
 Later: secondary tier completes async transfer
     └─ get_finished() → _process_finished_jobs()
+            ├─ spec.release()               ← free memory views
             └─ primary.unprotect_blocks()   ← decrement ref_cnt
 ```
 
@@ -494,13 +493,16 @@ Later: secondary tier completes async transfer
 Scheduler calls lookup(block_hashes)
     └─ blocks found in secondary tier
             ├─ primary.allocate_blocks()    ← allocate primary tier space for promotion
-            └─ tier.submit_load(job_id, block_hashes, primary_store_spec)
+            ├─ _create_memory_view_spec()   ← convert to CPUMemoryViewLoadStoreSpec
+            ├─ record job_metadata in _load_jobs
+            └─ tier.submit_load(job_metadata)
                     └─ async: secondary → primary
 
 lookup() returns None (retry later)
 
 Later: secondary tier completes async transfer
     └─ get_finished() → _process_finished_jobs()
+            ├─ spec.release()               ← free memory views
             └─ primary.finalize_blocks()    ← blocks now loadable from primary
 
 Next lookup() call:
@@ -509,7 +511,7 @@ Next lookup() call:
 
 ### 4.4 Tier-Agnostic API Usage
 
-The primary tier provides intent-based methods that make the tiered manager code self-documenting:
+`PrimaryTierManager` provides intent-based methods that make the tiered manager code self-documenting:
 
 | Method | Purpose | Internal Implementation |
 |--------|---------|------------------------|
@@ -517,15 +519,16 @@ The primary tier provides intent-based methods that make the tiered manager code
 | `unprotect_blocks()` | Release eviction protection | Calls `complete_load()` to decrement `ref_cnt` |
 | `allocate_blocks()` | Allocate space for incoming blocks | Calls `prepare_store()` |
 | `finalize_blocks()` | Make allocated blocks available | Calls `complete_store()` |
+| `get_primary_kv_tensors()` | Get CPU tensors for memory-view access | Returns list of CPU tensors (placeholder; to be implemented) |
 
 **Usage in TieredOffloadingManager:**
 
 | Operation | Method Used | Purpose |
 |-----------|-------------|---------|
 | Cascade (primary→secondary) | `protect_blocks()` | Get spec + protect blocks during async transfer |
-| Cascade completion | `unprotect_blocks()` | Release protection after transfer completes |
+| Cascade completion | `spec.release()` + `unprotect_blocks()` | Release memory views + protection after transfer |
 | Promotion (secondary→primary) | `allocate_blocks()` | Allocate space in primary tier |
-| Promotion completion | `finalize_blocks()` | Make promoted blocks available |
+| Promotion completion | `spec.release()` + `finalize_blocks()` | Release memory views + make promoted blocks available |
 
 When there are N secondary tiers, `primary.protect_blocks()` is called N times for the same set of blocks (in `complete_store()`), incrementing `ref_cnt` by N. Each completed secondary-tier store decrements it by 1 via `unprotect_blocks()`.
 
@@ -539,8 +542,8 @@ When there are N secondary tiers, `primary.protect_blocks()` is called N times f
 ┌─────────────────────────────────────────────────────────────┐
 │                    TieredOffloadingManager                  │
 │                  Implements OffloadingManager               │
-│  Minimal state: just tracks job_id counter                  │
-│  Secondary tiers report completion via JobResult            │
+│  State: _store_jobs, _load_jobs, _job_id_counter            │
+│  Direction inferred from which dict contains job_id         │
 └──────────────────────┬──────────────────────────────────────┘
                        │
          ┌─────────────┼─────────────┐
@@ -550,11 +553,11 @@ When there are N secondary tiers, `primary.protect_blocks()` is called N times f
 │ Primary Tier   │ │ Secondary      │ │ Secondary      │
 │ (CPU impl)     │ │ Tier 1         │ │ Tier 2         │
 │ LRU/ARC        │ │ Storage        │ │ Network        │
-│ Manager        │ │ Manager        │ │ Manager        │
-│                │ │                │ │                │
-│ ref_cnt tracks │ │ submit_store() │ │ submit_store() │
-│ pinned blocks  │ │ submit_load()  │ │ submit_load()  │
-│                │ │ get_finished() │ │ get_finished() │
+│ PrimaryTier    │ │ Manager        │ │ Manager        │
+│ Manager        │ │                │ │                │
+│                │ │ submit_store() │ │ submit_store() │
+│ ref_cnt tracks │ │ submit_load()  │ │ submit_load()  │
+│ pinned blocks  │ │ get_finished() │ │ get_finished() │
 └────────┬───────┘ └────────┬───────┘ └────────┬───────┘
          │                  │                  │
          ▼                  ▼                  ▼
@@ -576,7 +579,7 @@ GPU
  │ ▼  Direct access only via primary tier
 primary tier (CPU implementation)
  ▲ │  ref_cnt protects blocks during async transfers
- │ ▼
+ │ ▼  CPUMemoryViewLoadStoreSpec carries memory views to secondary tiers
 Storage (secondary tier 1)   ← submit_store / submit_load
  │
  ▼
@@ -595,12 +598,12 @@ Scheduler          TieredManager       Primary          Secondary Tier
     │───────────────────>│                │                    │
     │                    │ get_finished() │                    │
     │                    │────────────────────────────────────>│
-    │                    │<─ JobResult (decrement ref_cnt)  │
-    │                    │ unprotect_blocks()│                 │
-    │                    │───────────────>│                    │
+    │                    │<─ JobResult(job_id, success)     │
+    │                    │ spec.release() + unprotect_blocks() │
+    │                    │───────────────>│ (ref_cnt--)        │
     │                    │ prepare_store()│                    │
     │                    │───────────────>│                    │
-    │                    │<── store_spec  │                    │
+    │                    │<── PrepareStoreOutput              │
     │<── PrepareStoreOutput               │                    │
     │                    │                │                    │
     │ [Worker: GPU→primary transfer]      │                    │
@@ -613,17 +616,19 @@ Scheduler          TieredManager       Primary          Secondary Tier
     │                    │ *** CASCADE TO SECONDARY TIERS ***  │
     │                    │ protect_blocks()│                   │
     │                    │───────────────>│ (ref_cnt++)        │
-    │                    │<── load_spec   │                    │
-    │                    │ submit_store(job_id, load_spec)     │
+    │                    │<── BlockIDsLoadStoreSpec            │
+    │                    │ _create_memory_view_spec()          │
+    │                    │ → CPUMemoryViewLoadStoreSpec         │
+    │                    │ submit_store(job_metadata)          │
     │                    │────────────────────────────────────>│
-    │                    │                │  [async: primary→secondary]
+    │                    │   [async: primary→secondary]        │
     │                    │                │                    │
     │ [later] prepare_store() or lookup() │                    │
     │───────────────────>│                │                    │
     │                    │ get_finished() │                    │
     │                    │────────────────────────────────────>│
-    │                    │<─ JobResult(success=True)        │
-    │                    │ unprotect_blocks()│                 │
+    │                    │<─ JobResult(job_id, success=True) │
+    │                    │ spec.release() + unprotect_blocks() │
     │                    │───────────────>│ (ref_cnt--)        │
 ```
 
@@ -633,16 +638,18 @@ Scheduler          TieredManager       Primary          Secondary Tier
 
 | Aspect | Design Choice | Rationale |
 |--------|--------------|-----------|
-| Secondary tier store method | `submit_store(job_id, ...)` — async, non-blocking | Keeps Scheduler process responsive; actual transfers happen asynchronously |
-| Secondary tier load method | `submit_load(job_id, ...)` — async, non-blocking | Consistent with store; enables parallel transfers |
-| Completion tracking | `get_finished()` polls for completed jobs | Decouples job submission from completion; supports multiple in-flight transfers |
-| `job_id` parameter | Required in `submit_store()` / `submit_load()` | Unique identifier returned by secondary tier in `JobResult` |
-| Transfer direction | `TransferDirection` enum instead of boolean | More explicit and type-safe than `is_store` boolean flag |
+| Secondary tier store method | `submit_store(job_metadata)` — async, returns `None` | Keeps Scheduler process responsive; actual transfers happen asynchronously |
+| Secondary tier load method | `submit_load(job_metadata)` — async, returns `None` | Consistent with store; enables parallel transfers |
+| Job submission parameter | `JobMetadata(job_id, block_hashes, spec)` dataclass | Groups related data; manager stores it for lookup at completion |
+| Completion tracking | `get_finished()` returns `JobResult(job_id, success)` | Minimal result — direction and block_hashes are looked up from `_store_jobs`/`_load_jobs` |
+| Transfer direction | Inferred from `_store_jobs` vs `_load_jobs` dict membership | Avoids duplicating data in `JobResult`; makes manager state explicit |
+| Spec type for secondary tiers | `CPUMemoryViewLoadStoreSpec` (not plain `LoadStoreSpec`) | Secondary tiers need memory views for direct CPU access; conversion done by `_create_memory_view_spec()` |
+| `spec.release()` | Called before `unprotect_blocks()`/`finalize_blocks()` | Frees memory-view resources held by `CPUMemoryViewLoadStoreSpec` |
 | Cascade timing | Happens in `complete_store()` after GPU→Primary completes | Ensures blocks are ready in primary before cascading to secondary tiers |
-| `prepare_store()` ordering | Call `get_finished()` first, then primary | Decrements ref_cnt before eviction decisions, enabling accurate capacity assessment |
+| `prepare_store()` ordering | Call `_process_finished_jobs()` first, then primary | Decrements ref_cnt before eviction decisions, enabling accurate capacity assessment |
 | `primary.protect_blocks()` in cascade | Called once per secondary tier in `complete_store()` | Gets transfer spec AND increments `ref_cnt` to protect blocks during async transfer |
-| `ref_cnt` management | Explicitly managed via `protect_blocks()` / `unprotect_blocks()` | Protects blocks from eviction during async transfers; one increment per secondary tier |
-| Tier-agnostic API | Intent-based methods for primary tier operations | Makes code self-documenting; separates concerns from data flow direction |
+| `ref_cnt` management | Via `protect_blocks()` / `unprotect_blocks()` on `PrimaryTierManager` | Protects blocks from eviction during async transfers; one increment per secondary tier |
+| Tier-agnostic API | Intent-based methods on `PrimaryTierManager` (separate from `OffloadingManager`) | Makes code self-documenting; separates concerns from data flow direction |
 | Secondary tier evictions | Each tier manages its own eviction policy | Decentralized design; tiers are autonomous |
 | Offload to all tiers | ALL secondary tiers receive every block stored to primary | Maximizes data availability across the tier hierarchy |
 
@@ -668,10 +675,10 @@ kv_transfer_config = KVTransferConfig(
         "eviction_policy": "lru",  # Optional: "lru" or "arc" (default: "lru")
         "secondary_tiers": [  # Optional: list of secondary tier configs
             {
-                "type": "dummy",  # Tier type
-                "tier_name": "TestStorage",  # Tier name
-                "max_blocks": 10000,  # Optional: max blocks
-                "simulate_async": False  # Optional: for dummy tier
+                "type": "dummy",        # Required: tier type
+                "tier_name": "TestStorage",  # Required: tier name
+                "max_blocks": 10000,    # Tier-specific: max blocks (DummySecondaryTier)
+                "simulate_async": False # Tier-specific: for dummy tier
             }
         ]
     }
@@ -689,10 +696,9 @@ kv_transfer_config = KVTransferConfig(
 - `secondary_tiers` (list): List of secondary tier configurations (default: empty list)
 
 *Secondary Tier Configuration:*
-- `type` (str, required): Type of secondary tier (currently: `"dummy"`)
-- `tier_name` (str, optional): Name for this tier
-- `max_blocks` (int, optional): Maximum blocks for this tier
-- `simulate_async` (bool, optional): For dummy tier - simulate async behavior
+- `type` (str, **required**): Type of secondary tier (currently: `"dummy"`)
+- `tier_name` (str, **required**): Name for this tier — used for logging and identification
+- All other keys are passed as kwargs to the tier constructor
 
 **Usage Examples:**
 
@@ -749,11 +755,11 @@ For advanced use cases, you can directly instantiate `TieredOffloadingManager`:
 from vllm.v1.kv_offload.tiered_manager import TieredOffloadingManager
 from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
 from vllm.v1.kv_offload.backends.cpu import CPUBackend
-from vllm.v1.kv_offload.dummy_secondary_tier import DummySecondaryTier
+from vllm.v1.kv_offload.secondary_tiers.dummy import DummySecondaryTier
 
 # Create primary tier (CPU-based implementation)
 cpu_backend = CPUBackend(block_size=16, num_blocks=1000)
-primary_tier = LRUOffloadingManager(cpu_backend)
+primary_tier = LRUOffloadingManager(cpu_backend)  # LRUOffloadingManager is a PrimaryTierManager
 
 # Create secondary tier(s)
 storage_tier = DummySecondaryTier(
@@ -793,87 +799,23 @@ kv_transfer_config = KVTransferConfig(
 
 To add a new secondary tier type (e.g., "storage", "network"):
 
-1. Implement a class that extends [`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:179)
-2. Add the type to `_create_secondary_tier()` in [`TierOffloadingSpec`](vllm/v1/kv_offload/tiered.py)
+1. Implement a class that extends [`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:302)
+2. Add the type to `_create_secondary_tier()` in [`TierOffloadingSpec`](vllm/v1/kv_offload/tiered.py:127)
 
 Example:
 ```python
 def _create_secondary_tier(self, tier_config: dict):
-    tier_type = tier_config.get("type")
-    
+    config = tier_config.copy()
+    tier_type = config.pop("type", None)
+    tier_name = config.pop("tier_name", None)
+
     if tier_type == "dummy":
-        # ... existing code ...
+        return DummySecondaryTier(tier_name=tier_name, **config)
     elif tier_type == "storage":
-        return StorageSecondaryTier(...)
+        return StorageSecondaryTier(tier_name=tier_name, **config)
     elif tier_type == "network":
-        return NetworkSecondaryTier(...)
+        return NetworkSecondaryTier(tier_name=tier_name, **config)
     else:
         raise ValueError(f"Unknown secondary tier type: {tier_type}")
 ```
 
-### 7.5 Implementation Status
-
-**Phase 1: Core Infrastructure** ✅ **COMPLETE**
-- ✅ Updated [`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:274) abstract class with `submit_store()`, `submit_load()`, `get_finished()` API returning `JobResult`
-- ✅ Implemented [`TieredOffloadingManager`](vllm/v1/kv_offload/tiered_manager.py) with `_process_finished_jobs()`
-- ✅ `prepare_store()` calls `get_finished()` before `primary.prepare_store()`
-- ✅ Cascade calls `primary.protect_blocks()` once per secondary tier
-- ✅ Added tier-agnostic API methods to [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:82)
-
-**Phase 2: Dummy Secondary Tier** ✅ **COMPLETE**
-- ✅ Implemented [`DummySecondaryTier`](vllm/v1/kv_offload/secondary_tiers/dummy.py) for testing
-- ✅ Added comprehensive unit tests in [`test_tiered_offloading.py`](tests/v1/kv_offload/test_tiered_offloading.py)
-- ✅ All 16 tests passing
-
-**Phase 3: TierOffloadingSpec** ✅ **COMPLETE**
-- ✅ Implemented [`TierOffloadingSpec`](vllm/v1/kv_offload/tiered.py)
-- ✅ Registered in [`OffloadingSpecFactory`](vllm/v1/kv_offload/factory.py)
-- ✅ Configuration via `kv_connector_extra_config`
-- ✅ Support for multiple secondary tiers
-- ✅ Comprehensive validation and error handling
-
-**Phase 4: Storage Backend** ⏳ **FUTURE WORK**
-- Implement `StorageSecondaryTier` with file-based storage
-- Implement async transfer mechanisms using background threads/processes
-
-**Phase 5: Production Integration** ⏳ **FUTURE WORK**
-- Integration testing with vLLM scheduler
-- Performance tuning and benchmarking
-- Production deployment
-
----
-
-## 8. Summary
-
-This design provides a comprehensive architecture for multi-tier KV cache offloading that:
-
-1. ✅ Maintains the existing [`OffloadingManager`](vllm/v1/kv_offload/abstract.py:97) API contract
-2. ✅ Introduces [`SecondaryTierManager`](vllm/v1/kv_offload/abstract.py:274) with async `submit_store()` / `submit_load()` / `get_finished()` API returning `JobResult`
-3. ✅ Implements [`TieredOffloadingManager`](vllm/v1/kv_offload/tiered_manager.py) with minimal state tracking
-4. ✅ Supports staged promotion (Secondary → Primary → GPU)
-5. ✅ Enables cascade offloading to ALL secondary tiers (GPU → Primary → All Secondaries)
-6. ✅ Correctly manages `ref_cnt` via tier-agnostic API (`protect_blocks()` / `unprotect_blocks()`)
-7. ✅ Calls `get_finished()` before `primary.prepare_store()` to release pinned blocks
-8. ✅ Delegates eviction responsibility to each secondary tier
-9. ✅ Maintains backward compatibility
-10. ✅ All Scheduler-side methods are lightweight and non-blocking
-11. ✅ **Provides [`TierOffloadingSpec`](vllm/v1/kv_offload/tiered.py) for easy configuration and usage**
-12. ✅ **Tier-agnostic API makes code self-documenting and separates concerns from data flow direction**
-
-**Implementation Status:**
-- ✅ **Phases 1-3 COMPLETE**: Core infrastructure, testing framework, and spec implementation
-- ⏳ **Phases 4-5 FUTURE WORK**: Storage backend and production integration
-
-**Key Files:**
-- [`vllm/v1/kv_offload/abstract.py`](vllm/v1/kv_offload/abstract.py) - Core abstractions (`SecondaryTierManager`, `JobResult`, `TransferDirection`)
-- [`vllm/v1/kv_offload/tiered_manager.py`](vllm/v1/kv_offload/tiered_manager.py) - `TieredOffloadingManager` implementation
-- [`vllm/v1/kv_offload/tiered.py`](vllm/v1/kv_offload/tiered.py) - `TierOffloadingSpec` for configuration
-- [`vllm/v1/kv_offload/secondary_tiers/dummy.py`](vllm/v1/kv_offload/secondary_tiers/dummy.py) - Testing implementation
-- [`vllm/v1/kv_offload/factory.py`](vllm/v1/kv_offload/factory.py) - Spec registration
-- [`tests/v1/kv_offload/test_tiered_offloading.py`](tests/v1/kv_offload/test_tiered_offloading.py) - Comprehensive tests (16/16 passing)
-
-**Next Steps:**
-1. Implement `StorageSecondaryTier` with file-based storage
-2. Implement `NetworkSecondaryTier` for distributed caching
-3. Performance benchmarking and tuning
-4. Production deployment and monitoring

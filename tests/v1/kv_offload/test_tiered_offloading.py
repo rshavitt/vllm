@@ -12,11 +12,13 @@ These tests verify:
 """
 
 import pytest
+import torch
 
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.kv_offload.abstract import TransferDirection
+from vllm.v1.kv_offload.abstract import JobMetadata
 from vllm.v1.kv_offload.backends.cpu import CPUBackend
 from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
+from vllm.v1.kv_offload.mediums import CPUMemoryViewLoadStoreSpec
 from vllm.v1.kv_offload.secondary_tiers.dummy import DummySecondaryTier
 from vllm.v1.kv_offload.tiered_manager import TieredOffloadingManager
 
@@ -75,35 +77,48 @@ class TestDummySecondaryTier:
 
         # Store new block should evict blocks[1] (least recently used)
         new_block = make_block_hash(1, 3)
-        from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 
-        result = tier.submit_store(
-            job_id=1,
-            block_hashes=[new_block],
-            primary_load_spec=CPULoadStoreSpec([0]),
+        # Create a mock CPU tensor for testing
+        mock_tensor = torch.zeros(
+            (4, 16), dtype=torch.float32
+        )  # 4 blocks, 16 bytes each
+
+        tier.submit_store(
+            JobMetadata(
+                job_id=1,
+                block_hashes=[new_block],
+                spec=CPUMemoryViewLoadStoreSpec([0], [mock_tensor]),
+            )
         )
-
-        assert result is not None
-        assert len(result.block_hashes_evicted) == 1
-        assert result.block_hashes_evicted[0] == blocks[1]
 
         # Complete the job
         tier.get_finished()
 
-        # Verify new block is stored and old block is evicted
+        # Verify new block is stored and blocks[1] was evicted (LRU)
         assert new_block in tier.blocks
         assert blocks[1] not in tier.blocks
+        # blocks[0] and blocks[2] should still be present
+        assert blocks[0] in tier.blocks
+        assert blocks[2] in tier.blocks
 
     def test_async_simulation(self):
         """Test simulated async behavior."""
         tier = DummySecondaryTier(tier_name="Test", max_blocks=10, simulate_async=True)
 
         blocks = [make_block_hash(1, i) for i in range(2)]
-        from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
+
+        # Create a mock CPU tensor for testing
+        mock_tensor = torch.zeros(
+            (10, 16), dtype=torch.float32
+        )  # 10 blocks, 16 bytes each
 
         # Submit store job
         tier.submit_store(
-            job_id=1, block_hashes=blocks, primary_load_spec=CPULoadStoreSpec([0, 1])
+            JobMetadata(
+                job_id=1,
+                block_hashes=blocks,
+                spec=CPUMemoryViewLoadStoreSpec([0, 1], [mock_tensor]),
+            )
         )
 
         # Blocks should be in-flight
@@ -114,7 +129,6 @@ class TestDummySecondaryTier:
         completed = list(tier.get_finished())
         assert len(completed) == 1
         assert completed[0].job_id == 1
-        assert completed[0].direction == TransferDirection.PRIMARY_TO_SECONDARY
         assert completed[0].success is True
 
         # Blocks should now be stored
@@ -125,11 +139,19 @@ class TestDummySecondaryTier:
 class TestTieredOffloadingManager:
     """Tests for TieredOffloadingManager."""
 
-    def setup_method(self):
-        """Set up test fixtures."""
+    @pytest.fixture
+    def manager_setup(self):
         # Create primary tier (CPU-based)
-        self.cpu_backend = CPUBackend(block_size=16, num_blocks=5)
-        self.primary_tier = LRUOffloadingManager(self.cpu_backend)
+        cpu_backend = CPUBackend(block_size=16, num_blocks=5)
+        self.primary_tier = LRUOffloadingManager(cpu_backend)
+
+        # Mock get_primary_kv_tensors to return test tensors
+        # Create mock CPU tensors (2 layers, 5 blocks each, 16 bytes per block)
+        mock_cpu_tensors = [
+            torch.zeros((5, 16), dtype=torch.float32),
+            torch.zeros((5, 16), dtype=torch.float32),
+        ]
+        self.primary_tier.get_primary_kv_tensors = lambda: mock_cpu_tensors
 
         # Create secondary tiers
         self.secondary_tier1 = DummySecondaryTier(tier_name="Storage", max_blocks=10)
@@ -141,7 +163,7 @@ class TestTieredOffloadingManager:
             secondary_tiers=[self.secondary_tier1, self.secondary_tier2],
         )
 
-    def test_basic_store_to_primary(self):
+    def test_basic_store_to_primary(self, manager_setup):
         """Test basic store operation to primary tier."""
         blocks = [make_block_hash(1, i) for i in range(3)]
 
@@ -156,7 +178,7 @@ class TestTieredOffloadingManager:
         # Blocks should be in primary tier
         assert self.primary_tier.lookup(blocks) == 3
 
-    def test_cascade_to_all_secondary_tiers(self):
+    def test_cascade_to_all_secondary_tiers(self, manager_setup):
         """Test that blocks are cascaded to ALL secondary tiers."""
         blocks = [make_block_hash(1, i) for i in range(3)]
 
@@ -178,7 +200,7 @@ class TestTieredOffloadingManager:
         assert self.secondary_tier1.lookup(blocks) == 3
         assert self.secondary_tier2.lookup(blocks) == 3
 
-    def test_ref_cnt_protection_during_cascade(self):
+    def test_ref_cnt_protection_during_cascade(self, manager_setup):
         """Test that ref_cnt protects blocks during cascade."""
         blocks = [make_block_hash(1, i) for i in range(3)]
 
@@ -202,7 +224,7 @@ class TestTieredOffloadingManager:
             block = self.primary_tier.blocks[block_hash]
             assert block.ref_cnt == 0
 
-    def test_lookup_from_primary(self):
+    def test_lookup_from_primary(self, manager_setup):
         """Test lookup when blocks are in primary tier."""
         blocks = [make_block_hash(1, i) for i in range(3)]
 
@@ -213,7 +235,7 @@ class TestTieredOffloadingManager:
         # Lookup should find all blocks in primary
         assert self.manager.lookup(blocks) == 3
 
-    def test_promotion_from_secondary(self):
+    def test_promotion_from_secondary(self, manager_setup):
         """Test promotion of blocks from secondary to primary tier."""
         blocks = [make_block_hash(1, i) for i in range(3)]
 
@@ -234,7 +256,7 @@ class TestTieredOffloadingManager:
         # Next lookup should succeed
         assert self.manager.lookup(blocks) == 3
 
-    def test_partial_lookup(self):
+    def test_partial_lookup(self, manager_setup):
         """Test lookup with partial hits."""
         blocks = [make_block_hash(1, i) for i in range(5)]
 
@@ -245,7 +267,7 @@ class TestTieredOffloadingManager:
         # Lookup all 5 blocks should return 3 (first 3 found)
         assert self.manager.lookup(blocks) == 3
 
-    def test_eviction_in_primary_tier(self):
+    def test_eviction_in_primary_tier(self, manager_setup):
         """Test eviction in primary tier when capacity is exceeded."""
         # Primary tier has capacity of 5 blocks
         # First, fill the primary tier
@@ -267,7 +289,7 @@ class TestTieredOffloadingManager:
         assert len(result.block_hashes_evicted) == 2
         assert len(result.block_hashes_to_store) == 2
 
-    def test_touch_propagates_to_all_tiers(self):
+    def test_touch_propagates_to_all_tiers(self, manager_setup):
         """Test that touch() propagates to all tiers."""
         blocks = [make_block_hash(1, i) for i in range(3)]
 
@@ -291,7 +313,7 @@ class TestTieredOffloadingManager:
         secondary2_keys = list(self.secondary_tier2.blocks.keys())
         assert secondary2_keys[-3:] == list(reversed(blocks))
 
-    def test_failed_store_no_cascade(self):
+    def test_failed_store_no_cascade(self, manager_setup):
         """Test that failed GPU→primary store doesn't cascade."""
         blocks = [make_block_hash(1, i) for i in range(3)]
 
@@ -323,6 +345,13 @@ class TestTieredOffloadingManager:
         cpu_backend = CPUBackend(block_size=16, num_blocks=10)
         primary_tier = LRUOffloadingManager(cpu_backend)
 
+        # Mock get_primary_kv_tensors to return test tensors
+        mock_cpu_tensors = [
+            torch.zeros((10, 16), dtype=torch.float32),
+            torch.zeros((10, 16), dtype=torch.float32),
+        ]
+        primary_tier.get_primary_kv_tensors = lambda: mock_cpu_tensors
+
         manager = TieredOffloadingManager(
             primary_tier=primary_tier,
             secondary_tiers=[small_tier, large_tier],
@@ -352,7 +381,7 @@ class TestTieredOffloadingManager:
         # Large tier should have all 8 blocks
         assert large_tier.get_num_blocks() == 8
 
-    def test_prepare_store_processes_finished_jobs_first(self):
+    def test_prepare_store_processes_finished_jobs_first(self, manager_setup):
         """Test that prepare_store() calls _process_finished_jobs() first."""
         blocks = [make_block_hash(1, i) for i in range(3)]
 
@@ -382,6 +411,13 @@ class TestTieredOffloadingWithoutSecondaryTiers:
         """Test that manager works with empty secondary_tiers list."""
         cpu_backend = CPUBackend(block_size=16, num_blocks=5)
         primary_tier = LRUOffloadingManager(cpu_backend)
+
+        # Mock get_primary_kv_tensors to return test tensors
+        mock_cpu_tensors = [
+            torch.zeros((5, 16), dtype=torch.float32),
+            torch.zeros((5, 16), dtype=torch.float32),
+        ]
+        primary_tier.get_primary_kv_tensors = lambda: mock_cpu_tensors
 
         # Create manager with no secondary tiers
         manager = TieredOffloadingManager(primary_tier=primary_tier, secondary_tiers=[])

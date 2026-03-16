@@ -25,12 +25,17 @@ from collections.abc import Iterable
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
     JobId,
+    JobMetadata,
     LoadStoreSpec,
     OffloadingEvent,
     OffloadingManager,
     PrepareStoreOutput,
+    PrimaryTierManager,
     SecondaryTierManager,
-    TransferDirection,
+)
+from vllm.v1.kv_offload.mediums import (
+    BlockIDsLoadStoreSpec,
+    CPUMemoryViewLoadStoreSpec,
 )
 
 
@@ -52,7 +57,7 @@ class TieredOffloadingManager(OffloadingManager):
 
     def __init__(
         self,
-        primary_tier: OffloadingManager,
+        primary_tier: PrimaryTierManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
         enable_events: bool = False,
     ):
@@ -61,22 +66,56 @@ class TieredOffloadingManager(OffloadingManager):
 
         Args:
             primary_tier: The primary tier manager (e.g., LRUOffloadingManager
-                         with CPUBackend)
+                         with CPUBackend). Must inherit from PrimaryTierManager
+                         to provide the tier-agnostic API.
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
             enable_events: Whether to track offloading events
         """
-        self.primary_tier = primary_tier
+        self.primary_tier: PrimaryTierManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
 
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
+
+        # Job tracking: maps job_id to metadata for each transfer direction
+        # Store jobs: primary → secondary transfers
+        self._store_jobs: dict[JobId, JobMetadata] = {}
+        # Load jobs: secondary → primary transfers (promotions)
+        self._load_jobs: dict[JobId, JobMetadata] = {}
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
         job_id = self._job_id_counter
         self._job_id_counter += 1
         return job_id
+
+    def _create_memory_view_spec(
+        self, cpu_blocks_spec: LoadStoreSpec, readonly: bool = False
+    ) -> LoadStoreSpec:
+        """
+        Convert CPULoadStoreSpec to CPUMemoryViewLoadStoreSpec.
+
+        Takes a spec with just block IDs and enhances it with memory views
+        for direct CPU memory access by secondary tiers.
+
+        Args:
+            cpu_blocks_spec: CPULoadStoreSpec with block IDs
+            readonly: If True, create readonly memory views (for read operations)
+
+        Returns:
+            CPUMemoryViewLoadStoreSpec with block IDs and memory views
+        """
+        # Type assertion: primary tier always returns BlockIDsLoadStoreSpec
+        assert isinstance(cpu_blocks_spec, BlockIDsLoadStoreSpec)
+
+        cpu_tensors = self.primary_tier.get_primary_kv_tensors()
+
+        return CPUMemoryViewLoadStoreSpec(
+            block_ids=cpu_blocks_spec.block_ids.tolist(),
+            cpu_tensors=cpu_tensors,
+            readonly=readonly,
+        )
 
     def _process_finished_jobs(self):
         """
@@ -91,15 +130,27 @@ class TieredOffloadingManager(OffloadingManager):
         """
         for tier in self.secondary_tiers:
             for completed_job in tier.get_finished():
-                if completed_job.direction == TransferDirection.PRIMARY_TO_SECONDARY:
+                job_id = completed_job.job_id
+
+                # Determine job type by checking which dictionary contains the job_id
+                if job_id in self._store_jobs:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
-                    self.primary_tier.unprotect_blocks(completed_job.block_hashes)
-                else:
+                    job_metadata = self._store_jobs.pop(job_id)
+                    job_metadata.spec.release()
+                    self.primary_tier.unprotect_blocks(job_metadata.block_hashes)
+                elif job_id in self._load_jobs:
                     # secondary→primary transfer (promotion) completed.
                     # Make blocks available in primary tier.
+                    job_metadata = self._load_jobs.pop(job_id)
+                    job_metadata.spec.release()
                     self.primary_tier.finalize_blocks(
-                        completed_job.block_hashes, completed_job.success
+                        job_metadata.block_hashes, completed_job.success
+                    )
+                else:
+                    # Job ID not found in either dictionary - this shouldn't happen
+                    raise ValueError(
+                        f"Received finished job for unknown job_id {job_id}"
                     )
 
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
@@ -178,6 +229,7 @@ class TieredOffloadingManager(OffloadingManager):
         This method:
         1. Calls primary.allocate_blocks() to allocate space in primary tier
         2. Calls tier.submit_load() to start async transfer: secondary→primary
+        3. Tracks the job in _load_jobs dictionary
 
         Args:
             tier: The secondary tier to promote from
@@ -193,7 +245,19 @@ class TieredOffloadingManager(OffloadingManager):
 
         # Submit async load job: secondary→primary
         job_id = self._next_job_id()
-        tier.submit_load(job_id, block_hashes, primary_store_result.store_spec)
+
+        # Convert to memory view spec for secondary tier access (writable for loading)
+        primary_write_spec = self._create_memory_view_spec(
+            primary_store_result.store_spec, readonly=False
+        )
+
+        # Track this load job
+        job_metadata = JobMetadata(
+            job_id=job_id, block_hashes=block_hashes, spec=primary_write_spec
+        )
+        self._load_jobs[job_id] = job_metadata
+
+        tier.submit_load(job_metadata)
 
     def prepare_load(self, block_hashes: Iterable[BlockHash]) -> LoadStoreSpec:
         """
@@ -223,6 +287,7 @@ class TieredOffloadingManager(OffloadingManager):
         Args:
             block_hashes: Blocks to mark as recently used.
         """
+        block_hashes = list(block_hashes)
         self.primary_tier.touch(block_hashes)
         for tier in self.secondary_tiers:
             tier.touch(block_hashes)
@@ -281,6 +346,7 @@ class TieredOffloadingManager(OffloadingManager):
         1. Call primary.protect_blocks() to get LoadStoreSpec AND increment
            ref_cnt (protecting blocks during async transfer)
         2. Call tier.submit_store() to start async transfer: primary→secondary
+        3. Track the job in _store_jobs dictionary
 
         Args:
             block_hashes: Blocks that finished storing.
@@ -296,6 +362,10 @@ class TieredOffloadingManager(OffloadingManager):
             # If GPU→Primary transfer failed, don't cascade to secondary tiers
             return
 
+        # At this point, success=True is guaranteed, so block_hashes_list
+        # is list[BlockHash]
+        assert isinstance(block_hashes_list, list)
+
         # Step 2: Cascade to ALL secondary tiers
         # For each secondary tier, call primary.protect_blocks() to get the
         # LoadStoreSpec AND to increment ref_cnt (protecting blocks from
@@ -303,11 +373,24 @@ class TieredOffloadingManager(OffloadingManager):
         # secondary tier.
         for tier in self.secondary_tiers:
             # Get spec for reading from primary tier AND increment ref_cnt
-            primary_load_spec = self.primary_tier.protect_blocks(block_hashes_list)
+            primary_blocks_spec = self.primary_tier.protect_blocks(block_hashes_list)
+
+            # Convert to memory view spec for secondary tier access
+            # (readonly for storing)
+            primary_read_spec = self._create_memory_view_spec(
+                primary_blocks_spec, readonly=True
+            )
 
             # Submit async store job: primary→secondary
             job_id = self._next_job_id()
-            tier.submit_store(job_id, block_hashes_list, primary_load_spec)
+
+            # Track this store job
+            job_metadata = JobMetadata(
+                job_id=job_id, block_hashes=block_hashes_list, spec=primary_read_spec
+            )
+            self._store_jobs[job_id] = job_metadata
+
+            tier.submit_store(job_metadata)
 
         # Note: The async transfers are now in flight.
         # Their completion is tracked via get_finished() / _process_finished_jobs().
