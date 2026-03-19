@@ -536,101 +536,315 @@ When there are N secondary tiers, `primary.protect_blocks()` is called N times f
 
 ## 5. Architecture Diagrams
 
-### 5.1 System Architecture
+### 5.1 Class Hierarchy
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    TieredOffloadingManager                  │
-│                  Implements OffloadingManager               │
-│  State: _store_jobs, _load_jobs, _job_id_counter            │
-│  Direction inferred from which dict contains job_id         │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-         ┌─────────────┼─────────────┐
-         │             │             │
-         ▼             ▼             ▼
-┌────────────────┐ ┌────────────────┐ ┌────────────────┐
-│ Primary Tier   │ │ Secondary      │ │ Secondary      │
-│ (CPU impl)     │ │ Tier 1         │ │ Tier 2         │
-│ LRU/ARC        │ │ Storage        │ │ Network        │
-│ PrimaryTier    │ │ Manager        │ │ Manager        │
-│ Manager        │ │                │ │                │
-│                │ │ submit_store() │ │ submit_store() │
-│ ref_cnt tracks │ │ submit_load()  │ │ submit_load()  │
-│ pinned blocks  │ │ get_finished() │ │ get_finished() │
-└────────┬───────┘ └────────┬───────┘ └────────┬───────┘
-         │                  │                  │
-         ▼                  ▼                  ▼
-┌────────────────┐ ┌────────────────┐ ┌────────────────┐
-│ CPUBackend     │ │ StorageBackend │ │ NetworkBackend │
-└────────────────┘ └────────────────┘ └────────────────┘
-         │                  │                  │
-         ▼                  ▼                  ▼
-┌────────────────┐ ┌────────────────┐ ┌────────────────┐
-│ CPU Memory     │ │ Disk Storage   │ │ Remote Storage │
-└────────────────┘ └────────────────┘ └────────────────┘
+```mermaid
+classDiagram
+    direction TB
+
+    class LoadStoreSpec {
+        <<abstract>>
+        +medium() str
+        +release() None
+    }
+
+    class BlockIDsLoadStoreSpec {
+        <<abstract>>
+        +block_ids: ndarray
+    }
+
+    class GPULoadStoreSpec {
+        +medium() "GPU"
+    }
+
+    class CPULoadStoreSpec {
+        +medium() "CPU"
+    }
+
+    class CPUMemoryViewLoadStoreSpec {
+        +tensor_views: list[memoryview]
+        +block_stride_bytes: int
+        +release() None
+    }
+
+    LoadStoreSpec <|-- BlockIDsLoadStoreSpec
+    BlockIDsLoadStoreSpec <|-- GPULoadStoreSpec
+    BlockIDsLoadStoreSpec <|-- CPULoadStoreSpec
+    CPULoadStoreSpec <|-- CPUMemoryViewLoadStoreSpec
+
+    class OffloadingManager {
+        <<abstract>>
+        +lookup(block_hashes) int|None
+        +prepare_load(block_hashes) LoadStoreSpec
+        +touch(block_hashes)
+        +complete_load(block_hashes)
+        +prepare_store(block_hashes) PrepareStoreOutput|None
+        +complete_store(block_hashes, success)
+        +take_events() Iterable[OffloadingEvent]
+    }
+
+    class PrimaryTierManager {
+        <<abstract>>
+        +protect_blocks(block_hashes) LoadStoreSpec
+        +unprotect_blocks(block_hashes)
+        +allocate_blocks(block_hashes) PrepareStoreOutput|None
+        +finalize_blocks(block_hashes, success)
+        +get_primary_kv_tensors() list[Tensor]
+    }
+
+    class LRUOffloadingManager {
+        +backend: Backend
+        +blocks: OrderedDict[BlockHash, BlockStatus]
+    }
+
+    class ARCOffloadingManager {
+        +backend: Backend
+    }
+
+    class TieredOffloadingManager {
+        +primary_tier: PrimaryTierManager
+        +secondary_tiers: list[SecondaryTierManager]
+        -_store_jobs: dict[JobId, JobMetadata]
+        -_load_jobs: dict[JobId, JobMetadata]
+        -_job_id_counter: int
+    }
+
+    class SecondaryTierManager {
+        <<abstract>>
+        +lookup(block_hashes) int|None
+        +submit_store(job_metadata)
+        +submit_load(job_metadata)
+        +get_finished() Iterable[JobResult]
+        +touch(block_hashes)
+        +get_tier_name() str
+    }
+
+    class DummySecondaryTier {
+        +tier_name: str
+        +max_blocks: int
+        +simulate_async: bool
+    }
+
+    class Backend {
+        <<abstract>>
+        +block_size: int
+        +medium: str
+    }
+
+    class CPUBackend {
+        +num_blocks: int
+    }
+
+    OffloadingManager <|-- PrimaryTierManager
+    PrimaryTierManager <|-- LRUOffloadingManager
+    PrimaryTierManager <|-- ARCOffloadingManager
+    OffloadingManager <|-- TieredOffloadingManager
+    SecondaryTierManager <|-- DummySecondaryTier
+    Backend <|-- CPUBackend
+
+    TieredOffloadingManager o-- PrimaryTierManager : primary_tier
+    TieredOffloadingManager o-- SecondaryTierManager : secondary_tiers[]
+    LRUOffloadingManager o-- Backend : backend
+    ARCOffloadingManager o-- Backend : backend
 ```
 
-### 5.2 Data Flow
+### 5.2 System Architecture
 
-```
-GPU
- ▲ │
- │ ▼  Direct access only via primary tier
-primary tier (CPU implementation)
- ▲ │  ref_cnt protects blocks during async transfers
- │ ▼  CPUMemoryViewLoadStoreSpec carries memory views to secondary tiers
-Storage (secondary tier 1)   ← submit_store / submit_load
- │
- ▼
-Network (secondary tier 2)   ← submit_store / submit_load
+```mermaid
+graph TD
+    subgraph Scheduler Process
+        S[Scheduler]
+        TOM[TieredOffloadingManager\nimplements OffloadingManager]
+        PT[PrimaryTierManager\nLRUOffloadingManager / ARCOffloadingManager]
+        ST1[SecondaryTierManager 1\ne.g. StorageTier]
+        ST2[SecondaryTierManager 2\ne.g. NetworkTier]
+    end
 
-Store (offload):  GPU → primary → Storage, primary → Network  (all tiers)
-Load (restore):   Storage → primary → GPU  (staged promotion)
+    subgraph Storage Layer
+        CPU[CPU Memory\nvia CPUBackend]
+        DISK[Disk / NVMe]
+        NET[Remote Storage]
+    end
+
+    subgraph GPU Process
+        GPU[GPU Memory]
+        W[Worker]
+    end
+
+    S -->|lookup / prepare_store / complete_store| TOM
+    TOM -->|prepare_store / complete_store\nprotect_blocks / unprotect_blocks\nallocate_blocks / finalize_blocks| PT
+    TOM -->|submit_store / submit_load\nget_finished| ST1
+    TOM -->|submit_store / submit_load\nget_finished| ST2
+
+    PT <-->|BlockIDsLoadStoreSpec| CPU
+    ST1 <-->|CPUMemoryViewLoadStoreSpec| CPU
+    ST2 <-->|CPUMemoryViewLoadStoreSpec| CPU
+    ST1 <--> DISK
+    ST2 <--> NET
+
+    W -->|GPU → CPU\nusing LoadStoreSpec| CPU
+    CPU -->|CPU → GPU\nusing LoadStoreSpec| GPU
 ```
+
+**Key constraint:** GPU can only communicate with the **primary tier** (CPU memory). Secondary tiers must stage data through the primary tier.
 
 ### 5.3 Sequence Diagram: Store with Cascade
 
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant TOM as TieredOffloadingManager
+    participant PT as PrimaryTierManager
+    participant ST as SecondaryTierManager
+    participant W as Worker (GPU→CPU)
+
+    S->>TOM: prepare_store(block_hashes)
+    TOM->>ST: get_finished() [poll pending jobs]
+    ST-->>TOM: JobResult(job_id, success)
+    TOM->>PT: unprotect_blocks() [dec ref_cnt for completed stores]
+    TOM->>PT: prepare_store(block_hashes)
+    PT-->>TOM: PrepareStoreOutput(store_spec, evicted_blocks)
+    TOM-->>S: PrepareStoreOutput
+
+    Note over W: Worker executes GPU → CPU transfer
+
+    S->>TOM: complete_store(block_hashes, success=True)
+    TOM->>PT: complete_store(block_hashes) [blocks now ready in primary]
+
+    loop For each secondary tier
+        TOM->>PT: protect_blocks(block_hashes) [inc ref_cnt, get read spec]
+        PT-->>TOM: BlockIDsLoadStoreSpec
+        TOM->>TOM: _create_memory_view_spec() → CPUMemoryViewLoadStoreSpec
+        TOM->>ST: submit_store(JobMetadata{job_id, block_hashes, spec})
+        Note over ST: Async: primary → secondary transfer
+        TOM->>TOM: _store_jobs[job_id] = job_metadata
+    end
+
+    Note over ST: Transfer completes asynchronously
+
+    S->>TOM: prepare_store() or lookup() [triggers job poll]
+    TOM->>ST: get_finished()
+    ST-->>TOM: JobResult(job_id, success=True)
+    TOM->>TOM: spec.release() [free memory views]
+    TOM->>PT: unprotect_blocks(block_hashes) [dec ref_cnt]
 ```
-Scheduler          TieredManager       Primary          Secondary Tier
-    │                    │                │                    │
-    │ prepare_store()    │                │                    │
-    │───────────────────>│                │                    │
-    │                    │ get_finished() │                    │
-    │                    │────────────────────────────────────>│
-    │                    │<─ JobResult(job_id, success)     │
-    │                    │ spec.release() + unprotect_blocks() │
-    │                    │───────────────>│ (ref_cnt--)        │
-    │                    │ prepare_store()│                    │
-    │                    │───────────────>│                    │
-    │                    │<── PrepareStoreOutput              │
-    │<── PrepareStoreOutput               │                    │
-    │                    │                │                    │
-    │ [Worker: GPU→primary transfer]      │                    │
-    │                    │                │                    │
-    │ complete_store()   │                │                    │
-    │───────────────────>│                │                    │
-    │                    │ complete_store()│                   │
-    │                    │───────────────>│ (blocks ready)     │
-    │                    │                │                    │
-    │                    │ *** CASCADE TO SECONDARY TIERS ***  │
-    │                    │ protect_blocks()│                   │
-    │                    │───────────────>│ (ref_cnt++)        │
-    │                    │<── BlockIDsLoadStoreSpec            │
-    │                    │ _create_memory_view_spec()          │
-    │                    │ → CPUMemoryViewLoadStoreSpec         │
-    │                    │ submit_store(job_metadata)          │
-    │                    │────────────────────────────────────>│
-    │                    │   [async: primary→secondary]        │
-    │                    │                │                    │
-    │ [later] prepare_store() or lookup() │                    │
-    │───────────────────>│                │                    │
-    │                    │ get_finished() │                    │
-    │                    │────────────────────────────────────>│
-    │                    │<─ JobResult(job_id, success=True) │
-    │                    │ spec.release() + unprotect_blocks() │
-    │                    │───────────────>│ (ref_cnt--)        │
+
+### 5.4 Sequence Diagram: Load with Promotion
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant TOM as TieredOffloadingManager
+    participant PT as PrimaryTierManager
+    participant ST as SecondaryTierManager
+    participant W as Worker (CPU→GPU)
+
+    S->>TOM: lookup(block_hashes)
+    TOM->>ST: get_finished() [poll promotions in progress]
+    ST-->>TOM: JobResult(job_id, success)
+    TOM->>PT: finalize_blocks() [make promoted blocks available]
+
+    TOM->>PT: lookup(block_hashes)
+    PT-->>TOM: primary_hits (< total)
+
+    TOM->>ST: lookup(remaining_blocks)
+    ST-->>TOM: secondary_hits > 0
+
+    Note over TOM: _initiate_promotion()
+    TOM->>PT: allocate_blocks(blocks_to_promote)
+    PT-->>TOM: PrepareStoreOutput(write_spec, evicted)
+    TOM->>TOM: _create_memory_view_spec() → CPUMemoryViewLoadStoreSpec
+    TOM->>ST: submit_load(JobMetadata{job_id, blocks, write_spec})
+    Note over ST: Async: secondary → primary transfer
+    TOM->>TOM: _load_jobs[job_id] = job_metadata
+    TOM-->>S: None [retry later — promotion in progress]
+
+    Note over ST: Transfer completes asynchronously
+
+    S->>TOM: lookup(block_hashes) [retry]
+    TOM->>ST: get_finished()
+    ST-->>TOM: JobResult(job_id, success=True)
+    TOM->>TOM: spec.release() [free memory views]
+    TOM->>PT: finalize_blocks(block_hashes) [blocks now loadable]
+
+    TOM->>PT: lookup(block_hashes)
+    PT-->>TOM: all blocks found
+    TOM-->>S: hit_count
+
+    S->>TOM: prepare_load(block_hashes)
+    TOM->>PT: prepare_load(block_hashes) [inc ref_cnt]
+    PT-->>TOM: LoadStoreSpec
+    TOM-->>S: LoadStoreSpec
+
+    Note over W: Worker executes CPU → GPU transfer
+
+    S->>TOM: complete_load(block_hashes)
+    TOM->>PT: complete_load(block_hashes) [dec ref_cnt]
 ```
+
+### 5.5 Block State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> NOT_PRESENT
+
+    NOT_PRESENT --> STORING_TO_PRIMARY : prepare_store()\nref_cnt = -1 (not ready)
+
+    STORING_TO_PRIMARY --> NOT_PRESENT : complete_store(success=False)
+
+    STORING_TO_PRIMARY --> IN_PRIMARY : complete_store(success=True)\nref_cnt = 0 (ready)
+
+    IN_PRIMARY --> GPU_LOADING : prepare_load()\nref_cnt++
+
+    GPU_LOADING --> IN_PRIMARY : complete_load()\nref_cnt--
+
+    IN_PRIMARY --> CASCADING_TO_SECONDARY : complete_store() triggers cascade\nprotect_blocks() → ref_cnt++\nsubmit_store() submitted
+
+    CASCADING_TO_SECONDARY --> IN_PRIMARY : get_finished() → store complete\nspec.release()\nunprotect_blocks() → ref_cnt--
+
+    IN_PRIMARY --> NOT_PRESENT : evicted\n(only when ref_cnt = 0)
+
+    CASCADING_TO_SECONDARY --> IN_SECONDARY : [secondary tier internal state]
+
+    IN_SECONDARY --> PROMOTING_TO_PRIMARY : lookup() finds blocks\nallocate_blocks() + submit_load()
+
+    PROMOTING_TO_PRIMARY --> IN_PRIMARY : get_finished() → load complete\nspec.release()\nfinalize_blocks() → ref_cnt = 0
+
+    PROMOTING_TO_PRIMARY --> IN_SECONDARY : promotion failed
+
+    IN_SECONDARY --> NOT_IN_SECONDARY : evicted from secondary
+```
+
+### 5.6 `ref_cnt` Protection Mechanism
+
+```mermaid
+graph LR
+    subgraph BlockStatus
+        RC["ref_cnt\n-1 = not ready\n 0 = ready, evictable\n>0 = pinned, cannot evict"]
+    end
+
+    PST["prepare_store()\nallocation"] -->|"ref_cnt = -1\n(not ready)"| RC
+    CS["complete_store(success=True)"] -->|"ref_cnt = 0\n(ready)"| RC
+    PS["prepare_load()\nor protect_blocks()"] -->|"ref_cnt++\n(pin block)"| RC
+    CL["complete_load()\nor unprotect_blocks()"] -->|"ref_cnt--\n(unpin block)"| RC
+
+    subgraph "Cascade to N secondary tiers"
+        T1["submit_store() tier 1\nprotect_blocks() → ref_cnt++"]
+        T2["submit_store() tier 2\nprotect_blocks() → ref_cnt++"]
+        F1["job complete tier 1\nspec.release()\nunprotect_blocks() → ref_cnt--"]
+        F2["job complete tier 2\nspec.release()\nunprotect_blocks() → ref_cnt--"]
+    end
+
+    T1 --> RC
+    T2 --> RC
+    F1 --> RC
+    F2 --> RC
+
+    RC -->|"ref_cnt = 0"| E[Block can be evicted]
+    RC -->|"ref_cnt > 0"| NE[Block protected from eviction]
+```
+
+**Rule:** When N secondary tiers are active, `protect_blocks()` is called once per tier in `complete_store()`, incrementing `ref_cnt` by N. Each completed store decrements it by 1 via `unprotect_blocks()`.
 
 ---
 
