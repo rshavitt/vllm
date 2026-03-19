@@ -22,6 +22,7 @@ Key Design Principles:
 
 from collections.abc import Iterable
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
     JobId,
@@ -37,6 +38,8 @@ from vllm.v1.kv_offload.mediums import (
     BlockIDsLoadStoreSpec,
     CPUMemoryViewLoadStoreSpec,
 )
+
+logger = init_logger(__name__)
 
 
 class TieredOffloadingManager(OffloadingManager):
@@ -149,8 +152,10 @@ class TieredOffloadingManager(OffloadingManager):
                     )
                 else:
                     # Job ID not found in either dictionary - this shouldn't happen
-                    raise ValueError(
-                        f"Received finished job for unknown job_id {job_id}"
+                    logger.error(
+                        "Received finished job for unknown job_id %d from tier %s",
+                        job_id,
+                        tier.get_tier_name(),
                     )
 
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
@@ -411,6 +416,3 @@ class TieredOffloadingManager(OffloadingManager):
 
         # Also yield events from primary tier
         yield from self.primary_tier.take_events()
-
-
-# Made with Bob

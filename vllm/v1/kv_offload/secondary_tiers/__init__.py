@@ -16,5 +16,3 @@ __all__ = [
     "DummyLoadStoreSpec",
     "DummySecondaryTier",
 ]
-
-# Made with Bob

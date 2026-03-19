@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-TierOffloadingSpec: Spec for multi-tier KV cache offloading.
+TieredOffloadingSpec: Spec for multi-tier KV cache offloading.
 
 This spec creates a TieredOffloadingManager with a CPU-based primary tier
 and configurable secondary tiers (e.g., Storage, Network).
@@ -58,7 +58,7 @@ from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 logger = init_logger(__name__)
 
 
-class TierOffloadingSpec(OffloadingSpec):
+class TieredOffloadingSpec(OffloadingSpec):
     """
     Spec for multi-tier KV cache offloading.
 
@@ -79,7 +79,7 @@ class TierOffloadingSpec(OffloadingSpec):
         if not cpu_bytes_to_use:
             raise ValueError(
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config "
-                "for TierOffloadingSpec"
+                "for TieredOffloadingSpec"
             )
 
         # Calculate kv_bytes_per_offloaded_block (same as CPUOffloadingSpec)
@@ -254,7 +254,8 @@ class TierOffloadingSpec(OffloadingSpec):
         if not self._handlers:
             if not current_platform.is_cuda_alike():
                 raise RuntimeError(
-                    "TierOffloadingSpec is currently only supported on CUDA-alike GPUs"
+                    "TieredOffloadingSpec is currently only supported on "
+                    "CUDA-alike GPUs"
                 )
 
             # Create handlers for GPU↔CPU transfers
@@ -270,6 +271,3 @@ class TierOffloadingSpec(OffloadingSpec):
         assert self._handlers is not None
         yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.gpu_to_cpu_handler
         yield CPULoadStoreSpec, GPULoadStoreSpec, self._handlers.cpu_to_gpu_handler
-
-
-# Made with Bob

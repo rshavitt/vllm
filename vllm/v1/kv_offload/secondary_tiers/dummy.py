@@ -150,18 +150,18 @@ class DummySecondaryTier(SecondaryTierManager):
 
         evicted = []
         if num_blocks_to_evict > 0:
-            # Evict oldest blocks (LRU)
+            # Collect eviction candidates first (LRU order), then delete atomically
             protected = set(block_hashes_list)
-            for block_hash in list(self.blocks.keys()):
+            for block_hash in self.blocks:
                 if block_hash not in protected and block_hash not in self.in_flight:
-                    del self.blocks[block_hash]
                     evicted.append(block_hash)
-                    num_blocks_to_evict -= 1
-                    if num_blocks_to_evict == 0:
+                    if len(evicted) == num_blocks_to_evict:
                         break
             else:
-                # Could not evict enough blocks
+                # Could not collect enough eviction candidates
                 return
+            for block_hash in evicted:
+                del self.blocks[block_hash]
 
         # Mark blocks as in-flight
         for block_hash in blocks_to_store:
@@ -292,6 +292,3 @@ class DummySecondaryTier(SecondaryTierManager):
         self.in_flight.clear()
         self.completed_jobs.clear()
         self.pending_jobs.clear()
-
-
-# Made with Bob

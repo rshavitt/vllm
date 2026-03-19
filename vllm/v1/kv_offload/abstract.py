@@ -78,11 +78,13 @@ class OffloadingEvent:
     removed: bool
 
 
-# PRNOTE: We have two similar result types with overlapping terminology:
-# `JobResult`: primary (CPU) ↔ secondary transfers
-# `TransferResult`: GPU ↔ CPU transfers
-# Both use `job_id`, which is confusing since they operate at different system layers.
-# Should we rename or unify them?
+@dataclass
+class JobMetadata:
+    """Metadata for an in-flight async transfer job."""
+
+    job_id: JobId
+    block_hashes: list[BlockHash]
+    spec: LoadStoreSpec
 
 
 @dataclass
@@ -91,15 +93,6 @@ class JobResult:
 
     job_id: JobId
     success: bool
-
-
-@dataclass
-class JobMetadata:
-    """Metadata for an in-flight async transfer job."""
-
-    job_id: JobId
-    block_hashes: list[BlockHash]
-    spec: LoadStoreSpec
 
 
 class OffloadingManager(ABC):
@@ -288,15 +281,21 @@ class PrimaryTierManager(OffloadingManager):
         TieredManager will pass memoryviews of these tensors to secondary tier managers
         for data transfer operations.
 
-        TODO: This is a placeholder returning an empty list.
+        TODO: This is a placeholder returning a dummy zero tensor.
         Actual implementation requires CPUBackend to maintain reference
         to worker's CPU tensors.
 
         Returns:
             List of CPU tensors storing KV cache data. Currently returns
-            empty list as placeholder.
+            a dummy zero tensor as placeholder (wrong data).
         """
-        return []  # Placeholder - to be implemented
+        # PRNOTE: This is a placeholder. The real implementation requires
+        # CPUBackend to hold a reference to the worker's CPU KV tensors and
+        # return them here. Until that's wired up, secondary tier managers
+        # will receive memory views of a zero tensor (wrong data).
+        import torch
+
+        return [torch.zeros(1)]
 
 
 class SecondaryTierManager(ABC):
@@ -314,11 +313,6 @@ class SecondaryTierManager(ABC):
     """
 
     @abstractmethod
-    # PRNOTE: Do we want to allow lookup() returning None?
-    # Issue: Returning None for "blocks exist but transferring" is ambiguous.
-    # TieredOffloadingManager treats None as "not found" and checks the next tier,
-    # potentially causing redundant promotions from multiple tiers.
-
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
         """
         Check which blocks exist in this secondary tier.
