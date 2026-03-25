@@ -39,7 +39,7 @@ class JobMetadata:
 
 ### CPU Manager changes
 
-Extend the CPU Manager to expose its worker's `cpu_tensors` so the `TieredManager` can pass **zero-copy memory views** to secondary tiers for direct reads and writes.
+Extend the CPU Manager to expose its worker's `cpu_tensors` so the `TiersManager` can pass **zero-copy memory views** to secondary tiers for direct reads and writes.
 
 
 ## Key Design Principles
@@ -58,7 +58,7 @@ Extend the CPU Manager to expose its worker's `cpu_tensors` so the `TieredManage
 GPU → Primary Tier (CPU) → [all] Secondary Tiers
 ```
 
-When `TieredManager.complete_store()` is called, the KV data is confirmed in CPU memory. The `TieredManager` calls `submit_store()` on every secondary tier to cascade the data asynchronously.
+When `TiersManager.complete_store()` is called, the KV data is confirmed in CPU memory. The `TiersManager` calls `submit_store()` on every secondary tier to cascade the data asynchronously.
 
 ## Load Flow (Promotion)
 
@@ -66,9 +66,9 @@ When `TieredManager.complete_store()` is called, the KV data is confirmed in CPU
 GPU ← Primary Tier (CPU) ← Secondary Tier
 ```
 
-When `TieredManager.lookup()` is invoked:
+When `TiersManager.lookup()` is invoked:
 1. Check primary tier first.
 2. For remaining blocks, check each secondary tier in order.
 3. On a hit, call `submit_load()` to initiate async promotion to the primary tier, then return `None` (retry later).
 
-The `TieredManager` calls `get_finished()` on all secondary tiers each scheduling cycle to finalize completed jobs.
+The `TiersManager` calls `get_finished()` on all secondary tiers each scheduling cycle to finalize completed jobs.
