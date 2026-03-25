@@ -45,17 +45,19 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
-from vllm.v1.kv_offload.arc_manager import ARCOffloadingManager
-from vllm.v1.kv_offload.backends.cpu import CPUBackend
-from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.kv_offload.secondary_tiers.dummy import DummySecondaryTier
 from vllm.v1.kv_offload.spec import OffloadingSpec
-from vllm.v1.kv_offload.tiered_manager import TieredOffloadingManager
+from vllm.v1.kv_offload.tiered_manager import (
+    CPUPrimaryTierOffloadingManager,
+    TieredOffloadingManager,
+)
 from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 logger = init_logger(__name__)
+
+# TODO: think of reusing code from CPUOffloadingSpec
 
 
 class TieredOffloadingSpec(OffloadingSpec):
@@ -95,9 +97,7 @@ class TieredOffloadingSpec(OffloadingSpec):
             * len(kv_cache_config.kv_cache_tensors)
             * vllm_config.parallel_config.world_size
         )
-        kv_bytes_per_offloaded_block = kv_bytes_per_block * (
-            self.offloaded_block_size // self.gpu_block_size
-        )
+        kv_bytes_per_offloaded_block = kv_bytes_per_block * self.block_size_factor
 
         self.num_cpu_blocks = (
             int(cpu_bytes_to_use) // kv_bytes_per_offloaded_block
@@ -107,11 +107,6 @@ class TieredOffloadingSpec(OffloadingSpec):
 
         # Primary tier eviction policy
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
-        if self.eviction_policy not in ["lru", "arc"]:
-            raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. "
-                f"Supported policies: lru, arc"
-            )
 
         # Parse secondary tier configurations
         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
@@ -181,20 +176,14 @@ class TieredOffloadingSpec(OffloadingSpec):
             )
 
             # Create primary tier (CPU-based)
-            cpu_backend = CPUBackend(
-                block_size=self.offloaded_block_size, num_blocks=self.num_cpu_blocks
+            assert len(self.gpu_block_size) == 1
+            offloaded_block_size = self.gpu_block_size[0] * self.block_size_factor
+            primary_tier = CPUPrimaryTierOffloadingManager(
+                block_size=offloaded_block_size,
+                num_blocks=self.num_cpu_blocks,
+                cache_policy=self.eviction_policy,  # type: ignore[arg-type]
+                enable_events=enable_events,
             )
-
-            if self.eviction_policy == "lru":
-                primary_tier = LRUOffloadingManager(
-                    backend=cpu_backend, enable_events=enable_events
-                )
-            elif self.eviction_policy == "arc":
-                primary_tier = ARCOffloadingManager(
-                    backend=cpu_backend, enable_events=enable_events
-                )
-            else:
-                raise ValueError(f"Unknown eviction policy: {self.eviction_policy}")
 
             # Create secondary tiers
             secondary_tiers = []
@@ -260,10 +249,12 @@ class TieredOffloadingSpec(OffloadingSpec):
 
             # Create handlers for GPU↔CPU transfers
             # (same as CPUOffloadingSpec since primary tier is CPU-based)
+            assert len(self.gpu_block_size) == 1
+            gpu_block_size = self.gpu_block_size[0]
             self._handlers = CpuGpuOffloadingHandlers(
                 attn_backends=attn_backends,
-                gpu_block_size=self.gpu_block_size,
-                cpu_block_size=self.offloaded_block_size,
+                gpu_block_size=gpu_block_size,
+                cpu_block_size=gpu_block_size * self.block_size_factor,
                 num_cpu_blocks=self.num_cpu_blocks,
                 gpu_caches=kv_caches,
             )

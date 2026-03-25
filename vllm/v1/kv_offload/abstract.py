@@ -29,11 +29,6 @@ The class provides the following primitives:
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import torch
-
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -190,112 +185,6 @@ class OffloadingManager(ABC):
             New OffloadingEvents collected since the last call.
         """
         return ()
-
-
-class PrimaryTierManager(OffloadingManager):
-    """
-    Abstract base class for primary tier managers.
-
-    Combines OffloadingManager (core interface) with tier-agnostic alias
-    methods that make TieredOffloadingManager code self-documenting.
-
-    Usage in TieredOffloadingManager:
-    - allocate_blocks()/finalize_blocks() wrap prepare_store()/complete_store()
-      for promotion flows (secondary→primary)
-    - protect_blocks()/unprotect_blocks() wrap prepare_load()/complete_load()
-      for cascade flows (primary→secondary)
-
-    This avoids confusing patterns like calling `primary.prepare_load()` during
-    Store operations, making the code intent clear.
-    """
-
-    def allocate_blocks(
-        self, block_hashes: Iterable[BlockHash]
-    ) -> PrepareStoreOutput | None:
-        """
-        Allocate space for blocks in this tier.
-
-        This is a tier-agnostic alias for prepare_store() that makes the
-        intent clear when used by a tiered manager during promotion
-        (secondary→primary transfer).
-
-        Args:
-            block_hashes: the hashes identifying the blocks.
-
-        Returns:
-            A PrepareStoreOutput indicating where to store blocks and what
-            was evicted, or None if blocks cannot be allocated.
-        """
-        return self.prepare_store(block_hashes)
-
-    def finalize_blocks(self, block_hashes: Iterable[BlockHash], success: bool = True):
-        """
-        Finalize previously allocated blocks, making them available.
-
-        This is a tier-agnostic alias for complete_store() that makes the
-        intent clear when used by a tiered manager during promotion
-        (secondary→primary transfer).
-
-        Args:
-            block_hashes: the hashes identifying the blocks.
-            success: whether the blocks were successfully written.
-        """
-        self.complete_store(block_hashes, success)
-
-    def protect_blocks(self, block_hashes: Iterable[BlockHash]) -> LoadStoreSpec:
-        """
-        Protect blocks from eviction and return LoadStoreSpec for reading.
-
-        This is a tier-agnostic alias for prepare_load() that makes the
-        intent clear when used by a tiered manager during cascade
-        (primary→secondary transfer). Increments ref_cnt to prevent
-        eviction during async operations.
-
-        Args:
-            block_hashes: the hashes identifying the blocks.
-
-        Returns:
-            A LoadStoreSpec that can be used to read the blocks.
-        """
-        return self.prepare_load(block_hashes)
-
-    def unprotect_blocks(self, block_hashes: Iterable[BlockHash]):
-        """
-        Unprotect blocks, allowing eviction again.
-
-        This is a tier-agnostic alias for complete_load() that makes the
-        intent clear when used by a tiered manager during cascade
-        (primary→secondary transfer). Decrements ref_cnt after async
-        operations complete.
-
-        Args:
-            block_hashes: the hashes identifying the blocks.
-        """
-        self.complete_load(block_hashes)
-
-    def get_primary_kv_tensors(self) -> list["torch.Tensor"]:
-        """
-        Get the primary tier's KV cache tensors.
-
-        Returns the list of CPU tensors that store the KV cache data.
-        TieredManager will pass memoryviews of these tensors to secondary tier managers
-        for data transfer operations.
-
-        TODO: This is a placeholder returning a dummy zero tensor.
-        Actual implementation requires CPUBackend to maintain reference
-        to worker's CPU tensors.
-
-        Returns:
-            List of CPU tensors storing KV cache data. Currently returns
-            a dummy zero tensor as placeholder (wrong data).
-        """
-        # PRNOTE: This is a placeholder. The real implementation requires
-        # CPUBackend to hold a reference to the worker's CPU KV tensors and
-        # return them here. Until that's wired up, secondary tier managers
-        # will receive memory views of a zero tensor (wrong data).
-        import torch
-
-        return [torch.zeros(1)]
 
 
 class SecondaryTierManager(ABC):

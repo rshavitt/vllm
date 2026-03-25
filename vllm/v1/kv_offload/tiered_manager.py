@@ -22,6 +22,8 @@ Key Design Principles:
 
 from collections.abc import Iterable
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
@@ -31,9 +33,9 @@ from vllm.v1.kv_offload.abstract import (
     OffloadingEvent,
     OffloadingManager,
     PrepareStoreOutput,
-    PrimaryTierManager,
     SecondaryTierManager,
 )
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.mediums import (
     BlockIDsLoadStoreSpec,
     CPUMemoryViewLoadStoreSpec,
@@ -42,6 +44,47 @@ from vllm.v1.kv_offload.mediums import (
 logger = init_logger(__name__)
 
 
+# TODO: Think of reorganizing the tiers manager feature into files/dirs
+class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
+    # TODO: Rename to secondary tiers facing methods, or something similar...
+    """CPUOffloadingManager with alias methods for use by TieredOffloadingManager."""
+
+    def allocate_blocks(self, block_hashes) -> PrepareStoreOutput | None:
+        return self.prepare_store(block_hashes)
+
+    def finalize_blocks(self, block_hashes, success: bool = True) -> None:
+        self.complete_store(block_hashes, success)
+
+    def protect_blocks(self, block_hashes) -> LoadStoreSpec:
+        return self.prepare_load(block_hashes)
+
+    def unprotect_blocks(self, block_hashes) -> None:
+        self.complete_load(block_hashes)
+
+    def get_primary_kv_tensors(self) -> list[torch.Tensor]:
+        """
+        Get the primary tier's KV cache tensors.
+
+        Returns the list of CPU tensors that store the KV cache data.
+        TieredManager will pass memoryviews of these tensors to secondary tier
+        managers for data transfer operations.
+
+        TODO: This is a placeholder returning a dummy zero tensor.
+        Actual implementation requires CPUOffloadingManager to maintain a
+        reference to the worker's CPU tensors.
+
+        Returns:
+            List of CPU tensors storing KV cache data. Currently returns
+            a dummy zero tensor as placeholder (wrong data).
+        """
+        # PRNOTE: This is a placeholder. The real implementation requires
+        # CPUOffloadingManager to hold a reference to the worker's CPU KV
+        # tensors and return them here. Until that's wired up, secondary tier
+        # managers will receive memory views of a zero tensor (wrong data).
+        return [torch.zeros(1)]
+
+
+# TODO: Rename class name
 class TieredOffloadingManager(OffloadingManager):
     """
     Orchestrates multi-tier KV cache offloading.
@@ -60,7 +103,7 @@ class TieredOffloadingManager(OffloadingManager):
 
     def __init__(
         self,
-        primary_tier: PrimaryTierManager,
+        primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
         enable_events: bool = False,
     ):
@@ -68,14 +111,12 @@ class TieredOffloadingManager(OffloadingManager):
         Initialize the tiered offloading manager.
 
         Args:
-            primary_tier: The primary tier manager (e.g., LRUOffloadingManager
-                         with CPUBackend). Must inherit from PrimaryTierManager
-                         to provide the tier-agnostic API.
+            primary_tier: The primary tier manager (CPU-based).
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
             enable_events: Whether to track offloading events
         """
-        self.primary_tier: PrimaryTierManager = primary_tier
+        self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
 
         self._job_id_counter: int = 0

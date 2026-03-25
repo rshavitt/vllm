@@ -16,10 +16,9 @@ import torch
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import JobMetadata
-from vllm.v1.kv_offload.backends.cpu import CPUBackend
-from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
 from vllm.v1.kv_offload.mediums import CPUMemoryViewLoadStoreSpec
 from vllm.v1.kv_offload.secondary_tiers.dummy import DummySecondaryTier
+from vllm.v1.kv_offload.tiered import CPUPrimaryTierOffloadingManager
 from vllm.v1.kv_offload.tiered_manager import TieredOffloadingManager
 
 
@@ -142,8 +141,7 @@ class TestTieredOffloadingManager:
     @pytest.fixture
     def manager_setup(self):
         # Create primary tier (CPU-based)
-        cpu_backend = CPUBackend(block_size=16, num_blocks=5)
-        self.primary_tier = LRUOffloadingManager(cpu_backend)
+        self.primary_tier = CPUPrimaryTierOffloadingManager(block_size=16, num_blocks=5)
 
         # Mock get_primary_kv_tensors to return test tensors
         # Create mock CPU tensors (2 layers, 5 blocks each, 16 bytes per block)
@@ -212,7 +210,7 @@ class TestTieredOffloadingManager:
         # After complete_store, blocks should have ref_cnt > 0
         # (one for each secondary tier)
         for block_hash in blocks:
-            block = self.primary_tier.blocks[block_hash]
+            block = self.primary_tier._policy.get(block_hash)
             # ref_cnt should be 2 (one for each secondary tier)
             assert block.ref_cnt == 2
 
@@ -221,7 +219,7 @@ class TestTieredOffloadingManager:
 
         # After cascade completes, ref_cnt should be 0
         for block_hash in blocks:
-            block = self.primary_tier.blocks[block_hash]
+            block = self.primary_tier._policy.get(block_hash)
             assert block.ref_cnt == 0
 
     def test_lookup_from_primary(self, manager_setup):
@@ -303,7 +301,7 @@ class TestTieredOffloadingManager:
 
         # Verify touch was called on primary tier (check LRU order)
         # In LRU, touched blocks should be at the end
-        primary_keys = list(self.primary_tier.blocks.keys())
+        primary_keys = list(self.primary_tier._policy.blocks.keys())
         assert primary_keys[-3:] == list(reversed(blocks))
 
         # Verify touch was called on all secondary tiers
@@ -342,8 +340,7 @@ class TestTieredOffloadingManager:
         )
 
         # Create a fresh primary tier for this test
-        cpu_backend = CPUBackend(block_size=16, num_blocks=10)
-        primary_tier = LRUOffloadingManager(cpu_backend)
+        primary_tier = CPUPrimaryTierOffloadingManager(block_size=16, num_blocks=10)
 
         # Mock get_primary_kv_tensors to return test tensors
         mock_cpu_tensors = [
@@ -391,7 +388,7 @@ class TestTieredOffloadingManager:
 
         # Blocks should have ref_cnt = 2 (one for each secondary tier)
         for block_hash in blocks:
-            block = self.primary_tier.blocks[block_hash]
+            block = self.primary_tier._policy.get(block_hash)
             assert block.ref_cnt == 2
 
         # Call prepare_store again (should process finished jobs first)
@@ -400,7 +397,7 @@ class TestTieredOffloadingManager:
 
         # Original blocks should now have ref_cnt = 0
         for block_hash in blocks:
-            block = self.primary_tier.blocks[block_hash]
+            block = self.primary_tier._policy.get(block_hash)
             assert block.ref_cnt == 0
 
 
@@ -409,8 +406,7 @@ class TestTieredOffloadingWithoutSecondaryTiers:
 
     def test_works_without_secondary_tiers(self):
         """Test that manager works with empty secondary_tiers list."""
-        cpu_backend = CPUBackend(block_size=16, num_blocks=5)
-        primary_tier = LRUOffloadingManager(cpu_backend)
+        primary_tier = CPUPrimaryTierOffloadingManager(block_size=16, num_blocks=5)
 
         # Mock get_primary_kv_tensors to return test tensors
         mock_cpu_tensors = [
