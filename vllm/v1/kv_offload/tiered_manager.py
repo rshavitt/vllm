@@ -73,27 +73,27 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         decrementing ref_cnt."""
         self.complete_load(block_hashes)
 
-    def get_primary_kv_tensors(self) -> list[torch.Tensor]:
+    def get_primary_kv_tensors(self) -> torch.Tensor:
         """
-        Get the primary tier's KV cache tensors.
+        Get the primary tier's KV cache tensor.
 
-        Returns the list of CPU tensors that store the KV cache data.
-        TieredManager will pass memoryviews of these tensors to secondary tier
+        Returns the CPU tensor that stores the KV cache data.
+        TieredManager will pass a memoryview of this tensor to secondary tier
         managers for data transfer operations.
 
         TODO: This is a placeholder returning a dummy zero tensor.
         Actual implementation requires CPUOffloadingManager to maintain a
-        reference to the worker's CPU tensors.
+        reference to the worker's CPU tensor.
 
         Returns:
-            List of CPU tensors storing KV cache data. Currently returns
+            CPU tensor storing KV cache data. Currently returns
             a dummy zero tensor as placeholder (wrong data).
         """
         # PRNOTE: This is a placeholder. The real implementation requires
         # CPUOffloadingManager to hold a reference to the worker's CPU KV
-        # tensors and return them here. Until that's wired up, secondary tier
-        # managers will receive memory views of a zero tensor (wrong data).
-        return [torch.zeros(1)]
+        # tensor and return it here. Until that's wired up, secondary tier
+        # managers will receive a memory view of a zero tensor (wrong data).
+        return torch.zeros(1)
 
 
 class TiersOffloadingManager(OffloadingManager):
@@ -164,11 +164,11 @@ class TiersOffloadingManager(OffloadingManager):
         # Type assertion: primary tier always returns BlockIDsLoadStoreSpec
         assert isinstance(cpu_blocks_spec, BlockIDsLoadStoreSpec)
 
-        cpu_tensors = self.primary_tier.get_primary_kv_tensors()
+        cpu_tensor = self.primary_tier.get_primary_kv_tensors()
 
         return CPUMemoryViewLoadStoreSpec(
             block_ids=cpu_blocks_spec.block_ids.tolist(),
-            cpu_tensors=cpu_tensors,
+            cpu_tensor=cpu_tensor,
             readonly=readonly,
         )
 

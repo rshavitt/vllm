@@ -81,29 +81,23 @@ class CPUMemoryViewLoadStoreSpec(CPULoadStoreSpec):
 
     Attributes:
         block_ids: IDs of blocks to transfer (inherited from BlockIDsLoadStoreSpec)
-        tensor_views: Memory views of entire CPU KV cache tensors
+        tensor_view: Memory view of the CPU KV cache tensor
         block_stride_bytes: Byte stride between consecutive blocks
     """
 
     def __init__(
         self,
         block_ids: list[int],
-        cpu_tensors: list[torch.Tensor],
+        cpu_tensor: torch.Tensor,
         readonly: bool = False,
     ):
         super().__init__(block_ids)
-        views = []
-        for t in cpu_tensors:
-            view = memoryview(t.numpy())
-            assert ctypes.addressof(ctypes.c_byte.from_buffer(view)) == t.data_ptr(), (
-                "memoryview is not zero-copy: view does not point to tensor storage"
-            )
-            views.append(view.toreadonly() if readonly else view)
-        self.tensor_views = views
-        self.block_stride_bytes = (
-            cpu_tensors[0].stride(0) * cpu_tensors[0].element_size()
-        )
+        view = memoryview(cpu_tensor.numpy())
+        assert (
+            ctypes.addressof(ctypes.c_byte.from_buffer(view)) == cpu_tensor.data_ptr()
+        ), "memoryview is not zero-copy: view does not point to tensor storage"
+        self.tensor_view = view.toreadonly() if readonly else view
+        self.block_stride_bytes = cpu_tensor.stride(0) * cpu_tensor.element_size()
 
     def release(self) -> None:
-        for view in self.tensor_views:
-            view.release()
+        self.tensor_view.release()
