@@ -5,7 +5,7 @@ DummySecondaryTier: A simple in-memory secondary tier for testing.
 
 This implementation provides a minimal secondary tier that stores blocks
 in memory (using a dictionary) and simulates async transfers with immediate
-completion. It's useful for testing the TieredOffloadingManager without
+completion. It's useful for testing the TiersOffloadingManager without
 requiring actual storage or network backends.
 """
 

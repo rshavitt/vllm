@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-TieredOffloadingSpec: Spec for multi-tier KV cache offloading.
+TiersOffloadingSpec: Spec for multi-tier KV cache offloading.
 
-This spec creates a TieredOffloadingManager with a CPU-based primary tier
+This spec creates a TiersOffloadingManager with a CPU-based primary tier
 and configurable secondary tiers (e.g., Storage, Network).
 
 Configuration via kv_connector_extra_config:
@@ -50,7 +50,7 @@ from vllm.v1.kv_offload.secondary_tiers.dummy import DummySecondaryTier
 from vllm.v1.kv_offload.spec import OffloadingSpec
 from vllm.v1.kv_offload.tiered_manager import (
     CPUPrimaryTierOffloadingManager,
-    TieredOffloadingManager,
+    TiersOffloadingManager,
 )
 from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
@@ -60,11 +60,11 @@ logger = init_logger(__name__)
 # TODO: think of reusing code from CPUOffloadingSpec
 
 
-class TieredOffloadingSpec(OffloadingSpec):
+class TiersOffloadingSpec(OffloadingSpec):
     """
     Spec for multi-tier KV cache offloading.
 
-    Creates a TieredOffloadingManager with:
+    Creates a TiersOffloadingManager with:
     - Primary tier: CPU-based (LRU or ARC eviction policy)
     - Secondary tiers: Configurable via extra_config
 
@@ -81,7 +81,7 @@ class TieredOffloadingSpec(OffloadingSpec):
         if not cpu_bytes_to_use:
             raise ValueError(
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config "
-                "for TieredOffloadingSpec"
+                "for TiersOffloadingSpec"
             )
 
         # Calculate kv_bytes_per_offloaded_block (same as CPUOffloadingSpec)
@@ -114,7 +114,7 @@ class TieredOffloadingSpec(OffloadingSpec):
             raise ValueError("secondary_tiers must be a list of tier configurations")
 
         # Scheduler-side
-        self._manager: TieredOffloadingManager | None = None
+        self._manager: TiersOffloadingManager | None = None
 
         # Worker-side
         self._handlers: CpuGpuOffloadingHandlers | None = None
@@ -160,14 +160,14 @@ class TieredOffloadingSpec(OffloadingSpec):
 
     def get_manager(self) -> OffloadingManager:
         """
-        Get the TieredOffloadingManager.
+        Get the TiersOffloadingManager.
 
-        Creates a TieredOffloadingManager with:
+        Creates a TiersOffloadingManager with:
         - Primary tier: CPU-based (LRU or ARC)
         - Secondary tiers: As configured in extra_config
 
         Returns:
-            TieredOffloadingManager instance
+            TiersOffloadingManager instance
         """
         if not self._manager:
             kv_events_config = self.vllm_config.kv_events_config
@@ -205,14 +205,14 @@ class TieredOffloadingSpec(OffloadingSpec):
                     raise
 
             # Create tiered manager
-            self._manager = TieredOffloadingManager(
+            self._manager = TiersOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
                 enable_events=enable_events,
             )
 
             logger.info(
-                "Created TieredOffloadingManager with primary tier "
+                "Created TiersOffloadingManager with primary tier "
                 "(%s, %s blocks) and %s secondary tier(s)",
                 self.eviction_policy,
                 self.num_cpu_blocks,
@@ -230,7 +230,7 @@ class TieredOffloadingSpec(OffloadingSpec):
         Get offloading handlers for GPU↔CPU transfers.
 
         Note: Secondary tier transfers are handled internally by the
-        TieredOffloadingManager and do not require separate handlers here.
+        TiersOffloadingManager and do not require separate handlers here.
         The handlers returned are for GPU↔primary tier (CPU) transfers only.
 
         Args:
@@ -243,8 +243,7 @@ class TieredOffloadingSpec(OffloadingSpec):
         if not self._handlers:
             if not current_platform.is_cuda_alike():
                 raise RuntimeError(
-                    "TieredOffloadingSpec is currently only supported on "
-                    "CUDA-alike GPUs"
+                    "TiersOffloadingSpec is currently only supported on CUDA-alike GPUs"
                 )
 
             # Create handlers for GPU↔CPU transfers

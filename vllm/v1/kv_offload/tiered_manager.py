@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-TieredOffloadingManager: Multi-tier KV cache offloading orchestrator.
+TiersOffloadingManager: Multi-tier KV cache offloading orchestrator.
 
 This manager coordinates between a primary tier (with GPU access, currently
 CPU-based) and zero or more secondary tiers (Storage, Network, etc.) to
@@ -47,7 +47,7 @@ logger = init_logger(__name__)
 # TODO: Think of reorganizing the tiers manager feature into files/dirs
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     # TODO: Rename to secondary tiers facing methods, or something similar...
-    """CPUOffloadingManager with alias methods for use by TieredOffloadingManager."""
+    """CPUOffloadingManager with alias methods for use by TiersOffloadingManager."""
 
     def allocate_blocks(self, block_hashes) -> PrepareStoreOutput | None:
         return self.prepare_store(block_hashes)
@@ -84,8 +84,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         return [torch.zeros(1)]
 
 
-# TODO: Rename class name
-class TieredOffloadingManager(OffloadingManager):
+class TiersOffloadingManager(OffloadingManager):
     """
     Orchestrates multi-tier KV cache offloading.
 

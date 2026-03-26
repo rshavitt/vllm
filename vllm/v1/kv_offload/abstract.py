@@ -225,7 +225,7 @@ class SecondaryTierManager(ABC):
         transfer job, but does NOT perform the actual data transfer on the
         calling thread.
 
-        The caller (TieredOffloadingManager) must have already called
+        The caller (TiersOffloadingManager) must have already called
         primary.protect_blocks(block_hashes) to obtain job_metadata.spec and
         to increment ref_cnt on those blocks. ref_cnt will be decremented
         when get_finished() reports this job_id as complete and
@@ -256,7 +256,7 @@ class SecondaryTierManager(ABC):
         the transfer job, but does NOT perform the actual data transfer on
         the calling thread.
 
-        The caller (TieredOffloadingManager) must have already called
+        The caller (TiersOffloadingManager) must have already called
         primary.allocate_blocks(block_hashes) to obtain job_metadata.spec and
         to allocate space in the primary tier. When get_finished() reports
         this job_id as complete, primary.finalize_blocks() is called to make
@@ -275,7 +275,7 @@ class SecondaryTierManager(ABC):
         """
         Poll for finished async jobs (both loads and stores).
 
-        This is the mechanism by which the TieredOffloadingManager learns
+        This is the mechanism by which the TiersOffloadingManager learns
         that a transfer has finished and can:
           - Call primary.unprotect_blocks() to decrement ref_cnt (for stores)
           - Call primary.finalize_blocks() to make blocks loadable (for loads)
