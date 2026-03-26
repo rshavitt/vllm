@@ -1,16 +1,14 @@
 # RFC: Multi-Tier KV Cache Offloading
 
-
 ## Motivation
 
 The native KV offloading in vLLM v1 currently supports offloading **from GPU memory** to an external location (like CPU memory). This RFC extends the design to allow offloading **from CPU memory** to additional tiers such as local storage, object storage, and remote nodes (P/D disaggregation).
 
 ## Proposed Changes
 
-![Tier Diagram](tier-diagram-v2.png)
+![Tier Diagram](tier-diagram-v3.png)
 
 The `OffloadingConnector` interface is unchanged, it holds a single `OffloadingManager`. The new `TiersManager` implements that interface and orchestrates the tier hierarchy internally.
-
 
 ### Two tier types
 
@@ -41,7 +39,6 @@ class JobMetadata:
 
 Extend the CPU Manager to expose its worker's `cpu_tensors` so the `TiersManager` can pass **zero-copy memory views** to secondary tiers for direct reads and writes.
 
-
 ## Key Design Principles
 
 1. **Always cascade to all tiers**: When a block is confirmed in the primary tier, it is asynchronously pushed to every secondary tier.
@@ -54,7 +51,7 @@ Extend the CPU Manager to expose its worker's `cpu_tensors` so the `TiersManager
 
 ## Store Flow (Cascade)
 
-```
+```text
 GPU → Primary Tier (CPU) → [all] Secondary Tiers
 ```
 
@@ -62,11 +59,12 @@ When `TiersManager.complete_store()` is called, the KV data is confirmed in CPU 
 
 ## Load Flow (Promotion)
 
-```
+```text
 GPU ← Primary Tier (CPU) ← Secondary Tier
 ```
 
 When `TiersManager.lookup()` is invoked:
+
 1. Check primary tier first.
 2. For remaining blocks, check each secondary tier in order.
 3. On a hit, call `submit_load()` to initiate async promotion to the primary tier, then return `None` (retry later).
