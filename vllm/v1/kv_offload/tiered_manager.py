@@ -16,8 +16,8 @@ Key Design Principles:
    primary tier before GPU can access them
 4. Transparent retry mechanism — Return None from lookup() to signal
    "data is being promoted, try later"
-5. ref_cnt as eviction protection — primary.protect_blocks() increments ref_cnt,
-   protecting blocks from eviction until unprotect_blocks() is called
+5. ref_cnt as eviction protection — primary.prepare_read() increments ref_cnt,
+   protecting blocks from eviction until complete_read() is called
 """
 
 from collections.abc import Iterable
@@ -46,19 +46,31 @@ logger = init_logger(__name__)
 
 # TODO: Think of reorganizing the tiers manager feature into files/dirs
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
-    # TODO: Rename to secondary tiers facing methods, or something similar...
-    """CPUOffloadingManager with alias methods for use by TiersOffloadingManager."""
+    """CPUOffloadingManager with a primary/secondary transfer interface.
 
-    def allocate_blocks(self, block_hashes) -> PrepareStoreOutput | None:
+    The inherited prepare_store/complete_store/prepare_load/complete_load are the
+    GPU-facing OffloadingManager interface. These aliases expose the same operations
+    from the secondary tier perspective, where read/write refers to secondary
+    accessing primary. This avoids confusion when reading TiersOffloadingManager
+    code (e.g. calling prepare_load inside a cascade/store path would be misleading).
+    """
+
+    def prepare_write(self, block_hashes) -> PrepareStoreOutput | None:
+        """Allocate space in primary for a secondary->primary write (promotion)."""
         return self.prepare_store(block_hashes)
 
-    def finalize_blocks(self, block_hashes, success: bool = True) -> None:
+    def complete_write(self, block_hashes, success: bool = True) -> None:
+        """Finalize secondary->primary write, making blocks available."""
         self.complete_store(block_hashes, success)
 
-    def protect_blocks(self, block_hashes) -> LoadStoreSpec:
+    def prepare_read(self, block_hashes) -> LoadStoreSpec:
+        """Protect primary blocks for a primary->secondary read (cascade),
+        incrementing ref_cnt."""
         return self.prepare_load(block_hashes)
 
-    def unprotect_blocks(self, block_hashes) -> None:
+    def complete_read(self, block_hashes) -> None:
+        """Release protection after primary->secondary read completes,
+        decrementing ref_cnt."""
         self.complete_load(block_hashes)
 
     def get_primary_kv_tensors(self) -> list[torch.Tensor]:
@@ -166,9 +178,9 @@ class TiersOffloadingManager(OffloadingManager):
 
         This method:
         1. Calls get_finished() on each secondary tier
-        2. For completed stores (primary→secondary): calls primary.unprotect_blocks()
+        2. For completed stores (primary→secondary): calls primary.complete_read()
            to decrement ref_cnt
-        3. For completed loads (secondary→primary): calls primary.finalize_blocks()
+        3. For completed loads (secondary→primary): calls primary.complete_write()
            to make blocks available
         """
         for tier in self.secondary_tiers:
@@ -181,13 +193,13 @@ class TiersOffloadingManager(OffloadingManager):
                     # Decrement ref_cnt on primary blocks.
                     job_metadata = self._store_jobs.pop(job_id)
                     job_metadata.spec.release()
-                    self.primary_tier.unprotect_blocks(job_metadata.block_hashes)
+                    self.primary_tier.complete_read(job_metadata.block_hashes)
                 elif job_id in self._load_jobs:
                     # secondary→primary transfer (promotion) completed.
                     # Make blocks available in primary tier.
                     job_metadata = self._load_jobs.pop(job_id)
                     job_metadata.spec.release()
-                    self.primary_tier.finalize_blocks(
+                    self.primary_tier.complete_write(
                         job_metadata.block_hashes, completed_job.success
                     )
                 else:
@@ -272,7 +284,7 @@ class TiersOffloadingManager(OffloadingManager):
         Initiate promotion of blocks from a secondary tier to the primary tier.
 
         This method:
-        1. Calls primary.allocate_blocks() to allocate space in primary tier
+        1. Calls primary.prepare_write() to allocate space in primary tier
         2. Calls tier.submit_load() to start async transfer: secondary→primary
         3. Tracks the job in _load_jobs dictionary
 
@@ -281,7 +293,7 @@ class TiersOffloadingManager(OffloadingManager):
             block_hashes: Blocks to promote
         """
         # Allocate space in primary tier for promoted blocks
-        primary_store_result = self.primary_tier.allocate_blocks(block_hashes)
+        primary_store_result = self.primary_tier.prepare_write(block_hashes)
 
         if primary_store_result is None:
             # Cannot allocate space in primary tier (full)
@@ -388,7 +400,7 @@ class TiersOffloadingManager(OffloadingManager):
         secondary tiers.
 
         For each secondary tier:
-        1. Call primary.protect_blocks() to get LoadStoreSpec AND increment
+        1. Call primary.prepare_read() to get LoadStoreSpec AND increment
            ref_cnt (protecting blocks during async transfer)
         2. Call tier.submit_store() to start async transfer: primary→secondary
         3. Track the job in _store_jobs dictionary
@@ -412,13 +424,13 @@ class TiersOffloadingManager(OffloadingManager):
         assert isinstance(block_hashes_list, list)
 
         # Step 2: Cascade to ALL secondary tiers
-        # For each secondary tier, call primary.protect_blocks() to get the
+        # For each secondary tier, call primary.prepare_read() to get the
         # LoadStoreSpec AND to increment ref_cnt (protecting blocks from
-        # eviction during the async transfer). One protect_blocks() call per
+        # eviction during the async transfer). One prepare_read() call per
         # secondary tier.
         for tier in self.secondary_tiers:
             # Get spec for reading from primary tier AND increment ref_cnt
-            primary_blocks_spec = self.primary_tier.protect_blocks(block_hashes_list)
+            primary_blocks_spec = self.primary_tier.prepare_read(block_hashes_list)
 
             # Convert to memory view spec for secondary tier access
             # (readonly for storing)

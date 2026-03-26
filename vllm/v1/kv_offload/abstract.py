@@ -226,10 +226,10 @@ class SecondaryTierManager(ABC):
         calling thread.
 
         The caller (TiersOffloadingManager) must have already called
-        primary.protect_blocks(block_hashes) to obtain job_metadata.spec and
+        primary.prepare_read(block_hashes) to obtain job_metadata.spec and
         to increment ref_cnt on those blocks. ref_cnt will be decremented
         when get_finished() reports this job_id as complete and
-        primary.unprotect_blocks() is called.
+        primary.unprepare_read() is called.
 
         This method is responsible for:
           1. Filtering out blocks already present in this secondary tier
@@ -241,7 +241,7 @@ class SecondaryTierManager(ABC):
         Args:
             job_metadata: Job metadata including job_id, block_hashes, and
                           spec for reading blocks from the primary tier
-                          (obtained via primary.protect_blocks()).
+                          (obtained via primary.prepare_read()).
                           spec should be CPUMemoryViewLoadStoreSpec.
         """
         pass
@@ -257,15 +257,15 @@ class SecondaryTierManager(ABC):
         the calling thread.
 
         The caller (TiersOffloadingManager) must have already called
-        primary.allocate_blocks(block_hashes) to obtain job_metadata.spec and
+        primary.prepare_write(block_hashes) to obtain job_metadata.spec and
         to allocate space in the primary tier. When get_finished() reports
-        this job_id as complete, primary.finalize_blocks() is called to make
+        this job_id as complete, primary.complete_write() is called to make
         the blocks available for GPU loads.
 
         Args:
             job_metadata: Job metadata including job_id, block_hashes, and
                           spec for writing blocks into the primary tier
-                          (obtained via primary.allocate_blocks()).
+                          (obtained via primary.prepare_write()).
                           spec should be CPUMemoryViewLoadStoreSpec.
         """
         pass
@@ -277,8 +277,8 @@ class SecondaryTierManager(ABC):
 
         This is the mechanism by which the TiersOffloadingManager learns
         that a transfer has finished and can:
-          - Call primary.unprotect_blocks() to decrement ref_cnt (for stores)
-          - Call primary.finalize_blocks() to make blocks loadable (for loads)
+          - Call primary.unprepare_read() to decrement ref_cnt (for stores)
+          - Call primary.complete_write() to make blocks loadable (for loads)
 
         Returns:
             Iterable of JobResult objects for all jobs that have
