@@ -11,6 +11,11 @@ Configuration via kv_connector_extra_config:
   - block_size: (optional) Block size for offloaded blocks (default: GPU block size)
   - eviction_policy: (optional) Primary tier eviction policy: "lru" or
     "arc" (default: "lru")
+  - store_threshold: (optional) How many times a block must appear in lookup()
+    before it is eligible for CPU offloading. Values < 2 disable filtering
+    (default: 0)
+  - max_tracker_size: (optional) Maximum number of blocks tracked for
+    store_threshold filtering (default: 64000)
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "dummy", "storage", "network")
@@ -35,32 +40,21 @@ Example configuration:
 }
 """
 
-from collections.abc import Iterator
-
-import torch
-
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
+from vllm.v1.kv_offload.abstract import OffloadingManager
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.secondary_tiers.dummy import DummySecondaryTier
-from vllm.v1.kv_offload.spec import OffloadingSpec
 from vllm.v1.kv_offload.tiered_manager import (
     CPUPrimaryTierOffloadingManager,
     TiersOffloadingManager,
 )
-from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
-from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 logger = init_logger(__name__)
 
-# TODO: think of reusing code from CPUOffloadingSpec
 
-
-class TiersOffloadingSpec(OffloadingSpec):
+class TiersOffloadingSpec(CPUOffloadingSpec):
     """
     Spec for multi-tier KV cache offloading.
 
@@ -76,48 +70,13 @@ class TiersOffloadingSpec(OffloadingSpec):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
 
-        # Validate required configuration
-        cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
-        if not cpu_bytes_to_use:
-            raise ValueError(
-                "cpu_bytes_to_use must be specified in kv_connector_extra_config "
-                "for TiersOffloadingSpec"
-            )
-
-        # Calculate kv_bytes_per_offloaded_block (same as CPUOffloadingSpec)
-        assert kv_cache_config is not None
-        page_sizes = {
-            kv_cache_group.kv_cache_spec.page_size_bytes
-            for kv_cache_group in kv_cache_config.kv_cache_groups
-        }
-        assert len(page_sizes) == 1
-        page_size_bytes = page_sizes.pop()
-        kv_bytes_per_block = (
-            page_size_bytes
-            * len(kv_cache_config.kv_cache_tensors)
-            * vllm_config.parallel_config.world_size
-        )
-        kv_bytes_per_offloaded_block = kv_bytes_per_block * self.block_size_factor
-
-        self.num_cpu_blocks = (
-            int(cpu_bytes_to_use) // kv_bytes_per_offloaded_block
-            if kv_bytes_per_offloaded_block > 0
-            else 0
-        )
-
-        # Primary tier eviction policy
-        self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
-
         # Parse secondary tier configurations
         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
         if not isinstance(self.secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
 
-        # Scheduler-side
+        # Scheduler-side (narrower type than CPUOffloadingSpec._manager)
         self._manager: TiersOffloadingManager | None = None
-
-        # Worker-side
-        self._handlers: CpuGpuOffloadingHandlers | None = None
 
     def _create_secondary_tier(self, tier_config: dict):
         """
@@ -180,7 +139,7 @@ class TiersOffloadingSpec(OffloadingSpec):
             offloaded_block_size = self.gpu_block_size[0] * self.block_size_factor
             primary_tier = CPUPrimaryTierOffloadingManager(
                 block_size=offloaded_block_size,
-                num_blocks=self.num_cpu_blocks,
+                num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                 enable_events=enable_events,
             )
@@ -204,60 +163,26 @@ class TiersOffloadingSpec(OffloadingSpec):
                     )
                     raise
 
-            # Create tiered manager
+            # Create tiered manager. GPU↔CPU transfers use the inherited
+            # get_handlers(); secondary tier transfers are handled by the
+            # secondary tier managers and need no additional handlers here.
             self._manager = TiersOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
                 enable_events=enable_events,
+            )
+            # PRNOTE: should the store_filter apply to the TiersOffloadingManager or to
+            # the primary CPU manager?
+            self._manager = self._maybe_apply_store_filter(  # type: ignore[assignment]
+                self._manager
             )
 
             logger.info(
                 "Created TiersOffloadingManager with primary tier "
                 "(%s, %s blocks) and %s secondary tier(s)",
                 self.eviction_policy,
-                self.num_cpu_blocks,
+                self.num_blocks,
                 len(secondary_tiers),
             )
 
         return self._manager
-
-    def get_handlers(
-        self,
-        kv_caches: dict[str, torch.Tensor],
-        attn_backends: dict[str, type[AttentionBackend]],
-    ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
-        """
-        Get offloading handlers for GPU↔CPU transfers.
-
-        Note: Secondary tier transfers are handled internally by the
-        TiersOffloadingManager and do not require separate handlers here.
-        The handlers returned are for GPU↔primary tier (CPU) transfers only.
-
-        Args:
-            kv_caches: Dictionary of layer_name -> gpu_kv_cache tensor
-            attn_backends: Dictionary of layer_name -> AttentionBackend
-
-        Yields:
-            Tuples of (src_type, dst_type, offloading_handler) for GPU↔CPU
-        """
-        if not self._handlers:
-            if not current_platform.is_cuda_alike():
-                raise RuntimeError(
-                    "TiersOffloadingSpec is currently only supported on CUDA-alike GPUs"
-                )
-
-            # Create handlers for GPU↔CPU transfers
-            # (same as CPUOffloadingSpec since primary tier is CPU-based)
-            assert len(self.gpu_block_size) == 1
-            gpu_block_size = self.gpu_block_size[0]
-            self._handlers = CpuGpuOffloadingHandlers(
-                attn_backends=attn_backends,
-                gpu_block_size=gpu_block_size,
-                cpu_block_size=gpu_block_size * self.block_size_factor,
-                num_cpu_blocks=self.num_cpu_blocks,
-                gpu_caches=kv_caches,
-            )
-
-        assert self._handlers is not None
-        yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.gpu_to_cpu_handler
-        yield CPULoadStoreSpec, GPULoadStoreSpec, self._handlers.cpu_to_gpu_handler

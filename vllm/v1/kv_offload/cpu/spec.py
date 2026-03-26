@@ -56,6 +56,22 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
 
+    def _maybe_apply_store_filter(
+        self, manager: OffloadingManager
+    ) -> OffloadingManager:
+        # store_threshold: how many times a block must appear in lookup()
+        # before it is eligible for CPU offloading.  Values < 2 disable
+        # filtering (a threshold of 1 equals no filter; 0 is the default).
+        store_threshold = int(self.extra_config.get("store_threshold", 0))
+        if store_threshold >= 2:
+            max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
+            return FilterReusedOffloadingManager(
+                backing=manager,
+                store_threshold=store_threshold,
+                max_tracker_size=max_tracker_size,
+            )
+        return manager
+
     def get_manager(self) -> OffloadingManager:
         if not self._manager:
             kv_events_config = self.vllm_config.kv_events_config
@@ -73,20 +89,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                 enable_events=enable_events,
             )
-
-            # store_threshold: how many times a block must appear in lookup()
-            # before it is eligible for CPU offloading.  Values < 2 disable
-            # filtering (a threshold of 1 equals no filter; 0 is the default).
-            store_threshold = int(self.extra_config.get("store_threshold", 0))
-            if store_threshold >= 2:
-                max_tracker_size = int(
-                    self.extra_config.get("max_tracker_size", 64_000)
-                )
-                self._manager = FilterReusedOffloadingManager(
-                    backing=self._manager,
-                    store_threshold=store_threshold,
-                    max_tracker_size=max_tracker_size,
-                )
+            self._manager = self._maybe_apply_store_filter(self._manager)
         return self._manager
 
     def get_handlers(
