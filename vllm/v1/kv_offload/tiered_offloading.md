@@ -1048,7 +1048,7 @@ def _create_secondary_tier(self, tier_config: dict):
     if tier_type == "dummy":
         return DummySecondaryTier(tier_name=tier_name, **config)
     elif tier_type == "storage":
-        return StorageSecondaryTier(tier_name=tier_name, **config)
+        return FileSystemSecondaryTier(tier_name=tier_name, **config)
     elif tier_type == "network":
         return NetworkSecondaryTier(tier_name=tier_name, **config)
     else:

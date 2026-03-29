@@ -46,6 +46,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import OffloadingManager
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.secondary_tiers.dummy import DummySecondaryTier
+from vllm.v1.kv_offload.secondary_tiers.file_system import FileSystemTierManager
 from vllm.v1.kv_offload.tiered_manager import (
     CPUPrimaryTierOffloadingManager,
     TiersOffloadingManager,
@@ -109,12 +110,13 @@ class TiersOffloadingSpec(CPUOffloadingSpec):
 
         # Remaining parameters in config are tier-specific
         if tier_type == "dummy":
-            # DummySecondaryTier for testing
-            # Pass tier_name and tier-specific params to constructor
             return DummySecondaryTier(tier_name=tier_name, **config)
+        elif tier_type == "storage":
+            return FileSystemTierManager(tier_name=tier_name, **config)
         else:
             raise ValueError(
-                f"Unknown secondary tier type: {tier_type}. Supported types: dummy"
+                f"Unknown secondary tier type: {tier_type}. "
+                f"Supported types: dummy, storage"
             )
 
     def get_manager(self) -> OffloadingManager:

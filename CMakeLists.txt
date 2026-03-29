@@ -276,6 +276,18 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 #
+# _kv_storage_ops extension
+#
+
+message(STATUS "Enabling _kv_storage_ops extension.")
+define_extension_target(
+  _kv_storage_ops
+  DESTINATION vllm
+  LANGUAGE CXX
+  SOURCES "csrc/kv_storage_ops.cpp"
+  WITH_SOABI)
+
+#
 # _C extension
 #
 
