@@ -279,6 +279,18 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 #
+# _kv_file_system_ops extension
+#
+
+message(STATUS "Enabling _kv_file_system_ops extension.")
+define_extension_target(
+  _kv_file_system_ops
+  DESTINATION vllm
+  LANGUAGE CXX
+  SOURCES "csrc/kv_file_system_ops.cpp"
+  WITH_SOABI)
+
+#
 # _C extension
 #
 
