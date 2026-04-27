@@ -91,9 +91,11 @@ class ExampleSecondaryTier(SecondaryTierManager):
             return None
         return key in self.blocks
 
-    def submit_store(self, job_metadata: JobMetadata) -> None:
+    def submit_store(self, job_metadata: JobMetadata) -> bool:
         """
         Submit an async job to store blocks from primary tier to this tier.
+
+        Returns True if an async job was submitted, False if dropped.
 
         Args:
             job_metadata: Job metadata including job_id, keys, and
@@ -111,8 +113,8 @@ class ExampleSecondaryTier(SecondaryTierManager):
         blocks_to_store = [bh for bh in keys if bh not in self.blocks]
 
         if not blocks_to_store:
-            # All blocks already present
-            return
+            # All blocks already present — no async job submitted
+            return False
 
         # Evict blocks if needed (LRU policy)
         num_blocks_to_evict = len(blocks_to_store) - (
@@ -130,7 +132,7 @@ class ExampleSecondaryTier(SecondaryTierManager):
                         break
             else:
                 # Could not collect enough eviction candidates
-                return
+                return False
             for key in evicted:
                 del self.blocks[key]
 
@@ -149,6 +151,8 @@ class ExampleSecondaryTier(SecondaryTierManager):
         else:
             # Job completes immediately
             self._complete_store_job(internal_job_metadata)
+
+        return True
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         """

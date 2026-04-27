@@ -429,6 +429,100 @@ class TestTieringOffloadingManager:
         assert job_metadata.req_context.kv_transfer_params == {"priority": "high"}
 
 
+class TestRefCntLeakFix:
+    """Tests that ref_cnt is released when secondary tier drops a store job."""
+
+    def test_ref_cnt_released_when_secondary_tier_full(self):
+        """Deadlock regression: if secondary tier drops a job, primary blocks
+        must not stay pinned (ref_cnt > 0) forever.
+
+        Scenario: primary has 5 blocks, secondary has capacity 3.  After
+        filling the secondary, every new cascade job is dropped because
+        eviction candidates are all protected by the incoming job.  Without
+        the fix, ref_cnt on primary blocks grows without bound, all blocks
+        become un-evictable, and promotion from secondary is impossible.
+        """
+        primary_tier = CPUPrimaryTierOffloadingManager(num_blocks=5)
+        mock_arr = torch.zeros((5, 16), dtype=torch.int8).numpy()
+        primary_tier.create_kv_memoryview = lambda: memoryview(mock_arr)
+
+        # Secondary tier with capacity 3 (will fill up quickly).
+        secondary = DummySecondaryTier(
+            tier_name="TinyStorage", max_blocks=3, simulate_async=False
+        )
+        manager = TieringOffloadingManager(
+            primary_tier=primary_tier, secondary_tiers=[secondary]
+        )
+
+        # Store 3 blocks — fills secondary tier completely.
+        first_blocks = to_keys(range(3))
+        manager.prepare_store(first_blocks, _CTX)
+        manager.complete_store(first_blocks, success=True)
+        manager._process_finished_jobs()
+        assert secondary.get_num_blocks() == 3
+
+        # Store 3 more distinct blocks.  Secondary is full; the incoming
+        # keys are all "protected", so eviction candidates are empty →
+        # submit_store() returns False.  The manager must release ref_cnt.
+        second_blocks = to_keys(range(3, 6))
+        manager.prepare_store(second_blocks, _CTX)
+        manager.complete_store(second_blocks, success=True)
+        manager._process_finished_jobs()
+
+        # All primary blocks must have ref_cnt == 0 (not pinned).
+        for key in list(first_blocks) + list(second_blocks):
+            block = primary_tier._policy.get(key)
+            if block is not None:
+                assert block.ref_cnt == 0, (
+                    f"Block {key} has ref_cnt={block.ref_cnt}, expected 0"
+                )
+
+    def test_promotion_succeeds_after_secondary_full(self):
+        """After the secondary tier fills, blocks already in secondary must
+        still be promotable to primary.  This fails without the fix because
+        the primary fills with pinned blocks leaving no room for promotion.
+        """
+        primary_tier = CPUPrimaryTierOffloadingManager(num_blocks=4)
+        mock_arr = torch.zeros((4, 16), dtype=torch.int8).numpy()
+        primary_tier.create_kv_memoryview = lambda: memoryview(mock_arr)
+
+        secondary = DummySecondaryTier(
+            tier_name="SmallStorage", max_blocks=2, simulate_async=False
+        )
+        manager = TieringOffloadingManager(
+            primary_tier=primary_tier, secondary_tiers=[secondary]
+        )
+
+        # Manually put 2 blocks in secondary (simulates a prior cascade).
+        preloaded = to_keys([10, 11])
+        for k in preloaded:
+            secondary.blocks[k] = True
+
+        # Fill primary by storing 4 blocks and processing cascade jobs so
+        # ref_cnt goes back to 0.
+        primary_blocks = to_keys(range(4))
+        manager.prepare_store(primary_blocks, _CTX)
+        manager.complete_store(primary_blocks, success=True)
+        manager._process_finished_jobs()
+
+        # Now trigger a cascade that will be dropped (secondary is full, all
+        # eviction candidates are protected).  Without the fix this pins the
+        # primary blocks permanently.
+        manager.prepare_store(primary_blocks, _CTX)
+        manager.complete_store(primary_blocks, success=True)
+        manager._process_finished_jobs()
+
+        # Promotion: look up a block that is only in secondary.
+        # This requires primary to have room (evict something).  With the fix,
+        # ref_cnt is 0 and eviction works; without it, all blocks are pinned
+        # and _initiate_promotion returns immediately, leaving lookup stuck.
+        result = manager.lookup(preloaded[0], _CTX)
+        # Should be None (promotion initiated) or True (already promoted), not False.
+        assert result is not False, (
+            "lookup() returned False — block in secondary could not be promoted"
+        )
+
+
 class TestTieringOffloadingWithoutSecondaryTiers:
     """Test TieringOffloadingManager with no secondary tiers (backward compat)."""
 

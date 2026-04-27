@@ -65,7 +65,7 @@ class SecondaryTierManager(ABC):
         pass
 
     @abstractmethod
-    def submit_store(self, job_metadata: JobMetadata) -> None:
+    def submit_store(self, job_metadata: JobMetadata) -> bool:
         """
         Submit an async job to store blocks from the primary tier to this
         secondary tier.
@@ -76,9 +76,13 @@ class SecondaryTierManager(ABC):
 
         The caller (TieringOffloadingManager) must have already called
         primary.prepare_read(keys) to obtain job_metadata.block_ids and
-        to increment ref_cnt on those blocks. ref_cnt will be decremented
-        when get_finished() reports this job_id as complete and
-        primary.unprepare_read() is called.
+        to increment ref_cnt on those blocks.
+
+        IMPORTANT: Returns True if an async job was submitted (ref_cnt will
+        be decremented when get_finished() reports this job_id as complete).
+        Returns False if the job was dropped (all blocks already present, or
+        eviction failed) — in this case the caller MUST call
+        primary.complete_read(keys) immediately to release the ref_cnt.
 
         This method is responsible for:
           1. Filtering out blocks already present in this secondary tier
@@ -91,6 +95,9 @@ class SecondaryTierManager(ABC):
             job_metadata: Job metadata including job_id, keys, and
                           block_ids for reading blocks from the primary tier
                           (obtained via primary.prepare_read()).
+
+        Returns:
+            True if an async job was submitted; False if the job was dropped.
         """
         pass
 

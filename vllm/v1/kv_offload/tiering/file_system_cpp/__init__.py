@@ -183,10 +183,12 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
             return None
         return key in self._blocks
 
-    def submit_store(self, job_metadata: JobMetadata) -> None:
+    def submit_store(self, job_metadata: JobMetadata) -> bool:
         """
         Submit a store job to the C++ thread pool immediately.
         Read-vs-write priority is handled by the dual-queue pool.
+
+        Returns True if an async job was submitted, False if dropped.
         """
         assert isinstance(job_metadata.spec, CPULoadStoreSpec), (
             f"Expected CPULoadStoreSpec, got {type(job_metadata.spec)}"
@@ -205,7 +207,7 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
             if key not in self._blocks and key not in self._in_flight
         ]
         if not pairs:
-            return
+            return False
 
         keys_to_store, block_ids_to_store = map(list, zip(*pairs))
 
@@ -223,7 +225,7 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
                     num_to_evict,
                     job_id,
                 )
-                return
+                return False
 
             protected = set(all_keys)
             evicted = []
@@ -241,7 +243,7 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
                     num_to_evict,
                     job_id,
                 )
-                return
+                return False
             for key in evicted:
                 file_path = self.get_file_name(get_offload_block_hash(key))
                 try:
@@ -280,6 +282,7 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
             keys=keys_to_store,
             buffer=buffer,
         )
+        return True
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         """

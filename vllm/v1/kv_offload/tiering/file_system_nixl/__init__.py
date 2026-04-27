@@ -494,9 +494,11 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
             return None
         return key in self._blocks
 
-    def submit_store(self, job_metadata: JobMetadata) -> None:
+    def submit_store(self, job_metadata: JobMetadata) -> bool:
         """
         Submit a store job: enqueue one write task per block to the write queue.
+
+        Returns True if an async job was submitted, False if dropped.
         """
         assert isinstance(job_metadata.spec, CPULoadStoreSpec), (
             f"Expected CPULoadStoreSpec, got {type(job_metadata.spec)}"
@@ -515,7 +517,7 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
             if key not in self._blocks and key not in self._in_flight
         ]
         if not pairs:
-            return
+            return False
 
         keys_to_store, block_ids_to_store = map(list, zip(*pairs))
 
@@ -533,7 +535,7 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
                     num_to_evict,
                     job_id,
                 )
-                return
+                return False
 
             protected = set(all_keys)
             evicted = []
@@ -551,7 +553,7 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
                     num_to_evict,
                     job_id,
                 )
-                return
+                return False
             for key in evicted:
                 file_path = self.get_file_name(get_offload_block_hash(key))
                 try:
@@ -595,6 +597,7 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
             buffer=buffer,
             state=state,
         )
+        return True
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         """

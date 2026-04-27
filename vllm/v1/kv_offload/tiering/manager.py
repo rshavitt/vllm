@@ -413,7 +413,14 @@ class TieringOffloadingManager(OffloadingManager):
             )
             self._store_jobs[job_id] = job_metadata
 
-            tier.submit_store(job_metadata)
+            accepted = tier.submit_store(job_metadata)
+            if not accepted:
+                # Tier dropped the job (all blocks already present, or eviction
+                # failed). Release the ref_cnt we just acquired — otherwise those
+                # primary blocks are permanently pinned and can never be evicted,
+                # which eventually deadlocks promotion from secondary tiers.
+                del self._store_jobs[job_id]
+                self.primary_tier.complete_read(keys_list)
 
         # Note: The async transfers are now in flight.
         # Their completion is tracked via get_finished() / _process_finished_jobs().
