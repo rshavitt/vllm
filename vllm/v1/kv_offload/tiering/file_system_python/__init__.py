@@ -15,7 +15,7 @@ Thread pool:
 
 Store path:
     Each block is written atomically: data is written to a temp file
-    (<dest>.{job_id}.tmp) via os.write, then os.replace'd to the final path.
+    (<dest_path_with_.tmp_instead_of_.bin>) via os.write, then os.replace'd to the final path.
 
 Load path:
     Data is read from the block file directly via os.readv into the
@@ -27,10 +27,8 @@ File naming:  <base_path>/<hhh>/<hh>/<hash_hex>.bin
 
 import collections
 import functools
-import mmap
 import os
 import threading
-from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -178,97 +176,70 @@ def _ensure_dirs(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
 
-def _write_block(
-    tmp_path: str,
+# ---------------------------------------------------------------------------
+# Per-block I/O callbacks — module-level so they are not re-created each loop
+# ---------------------------------------------------------------------------
+
+def _store_block(
     dest_path: str,
-    view: memoryview,
+    buffer: memoryview,
     offset: int,
     block_size: int,
+    state: "_JobState",
 ) -> None:
     """
-    Write one KV block from *view[offset:offset+block_size]* to *dest_path*
-    atomically (write to tmp_path, os.replace).
-
-    O_DIRECT requires a page-aligned buffer; data is bounced through an
-    anonymous mmap so the kernel bypass is preserved without posix_memalign.
+    Store callback: write one KV block atomically, optionally checking if it exists first.
+    
+    Writes to a temp file then atomically replaces the destination.
+    Uses O_DIRECT with page-aligned bounce buffer for kernel bypass.
     """
-    _ensure_dirs(dest_path)
-    aligned_size = -(-block_size // mmap.PAGESIZE) * mmap.PAGESIZE
-    bounce = mmap.mmap(-1, aligned_size)
-    mv = memoryview(bounce)
+    tmp_path = dest_path.replace('.bin', '.tmp')
     try:
-        mv[:block_size] = view[offset: offset + block_size]
+        # Check if block already exists to avoid redundant writes
+        if os.path.exists(dest_path):
+            state.task_done(True)
+            return
+        
+        # Write block atomically
+        _ensure_dirs(dest_path)
+        slice = buffer[offset: offset + block_size]
         fd = os.open(
             tmp_path,
             os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_DIRECT,
             0o644,
         )
         try:
-            os.write(fd, mv[:aligned_size])
+            os.write(fd, slice)
         finally:
             os.close(fd)
-    finally:
-        mv.release()
-        bounce.close()
-    os.replace(tmp_path, dest_path)
+        os.replace(tmp_path, dest_path)
+        state.task_done(True)
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        state.task_done(False, exc)
 
 
-def _read_block(
+def _load_block(
     source_path: str,
     view: memoryview,
     offset: int,
     block_size: int,
+    state: "_JobState",
 ) -> None:
     """
-    Read one KV block from *source_path* into *view[offset:offset+block_size]*.
+    Load callback: read one KV block from disk.
     """
-    aligned_size = -(-block_size // mmap.PAGESIZE) * mmap.PAGESIZE
-    bounce = mmap.mmap(-1, aligned_size)
-    mv = memoryview(bounce)
     try:
         fd = os.open(source_path, os.O_RDONLY | os.O_DIRECT)
+        slice = view[offset: offset + block_size]
         try:
-            os.readv(fd, [mv[:aligned_size]])
+            os.readv(fd, [slice])
         finally:
             os.close(fd)
-        view[offset: offset + block_size] = mv[:block_size]
-    finally:
-        mv.release()
-        bounce.close()
-
-
-# ---------------------------------------------------------------------------
-# Per-block I/O callbacks — module-level so they are not re-created each loop
-# ---------------------------------------------------------------------------
-
-def _run_store(
-    tmp_path: str,
-    dest_path: str,
-    buf: memoryview,
-    offset: int,
-    block_size: int,
-    state: "_JobState",
-) -> None:
-    try:
-        _write_block(tmp_path, dest_path, buf, offset, block_size)
         state.task_done(True)
     except Exception as exc:
         state.task_done(False, exc)
-
-
-def _run_load(
-    source_path: str,
-    buf: memoryview,
-    offset: int,
-    block_size: int,
-    state: "_JobState",
-) -> None:
-    try:
-        _read_block(source_path, buf, offset, block_size)
-        state.task_done(True)
-    except Exception as exc:
-        state.task_done(False, exc)
-
 
 # ---------------------------------------------------------------------------
 # _ActiveJob
@@ -291,10 +262,6 @@ class FileSystemTierManagerPython(SecondaryTierManager):
     """
     Pure-Python disk-backed secondary tier.
 
-    Mirrors FileSystemTierManager (C++ tier) in structure: same file naming,
-    LRU eviction, in-flight tracking, and job lifecycle.  I/O is performed by
-    a DualQueueThreadPool (one task per block file).
-
     Read-priority threads service load jobs preferentially; write-priority
     threads service store jobs preferentially.  Both groups can drain either
     queue, so neither starves.
@@ -302,34 +269,24 @@ class FileSystemTierManagerPython(SecondaryTierManager):
     submit_store / submit_load are non-blocking: they enqueue tasks and return.
     get_finished() polls job completion and returns completed JobResults.
 
-    Eviction:
-        LRU via OrderedDict. Blocks in-flight are never evicted.
     """
 
     def __init__(
         self,
         base_path: str,
-        max_blocks: int,
         tier_name: str = "StoragePython",
-        n_read_threads: int = 32,
+        n_read_threads: int = 16,
         n_write_threads: int = 16,
-        tmp_dir: str | None = None,
     ):
         """
         Args:
             base_path: Root directory for block files.
-            max_blocks: Maximum number of blocks to keep indexed (LRU eviction).
             tier_name: Identifier string returned by get_tier_name().
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
-            tmp_dir: Directory for atomic-write temp files. Defaults to
-                base_path. Must be on the same filesystem as base_path for
-                os.replace() to be atomic.
         """
         self._base_path = base_path
-        self._max_blocks = max_blocks
         self._tier_name = tier_name
-        self._tmp_dir = tmp_dir or base_path
 
         self._pool = _DualQueueThreadPool(
             n_read_threads,
@@ -337,57 +294,31 @@ class FileSystemTierManagerPython(SecondaryTierManager):
             thread_name_prefix="vllm_kv_py_fs",
         )
 
-        # LRU ordered set: block_hash -> True
-        self._blocks: OrderedDict[OffloadKey, bool] = OrderedDict()
-
-        # block_hash -> job_id (prevents eviction mid-transfer)
-        self._in_flight: dict[OffloadKey, JobId] = {}
-
         # job_id -> _ActiveJob for all submitted (in-flight) jobs
         self._active_jobs: dict[JobId, _ActiveJob] = {}
 
-        # Number of blocks in _blocks that are NOT currently in _in_flight.
-        self._evictable_count: int = 0
-
         # Long-lived memoryview of the primary CPU tensor (set once by TieringOffloadingManager).
         self._primary_view: memoryview | None = None
+        self._block_size: int = 0
 
-    # ------------------------------------------------------------------
-    # File-naming (identical to C++ tier)
-    # ------------------------------------------------------------------
-
-    def get_file_name(self, block_hash: int | bytes) -> str:
+    def get_file_name(self, key: OffloadKey) -> str:
         """
         Return the file path for a KV block.
         <base>/<hhh>/<hh>/<hash>.bin — hash-based subdirectories to limit
         directory fan-out.
         """
-        if isinstance(block_hash, bytes):
-            block_hash = int.from_bytes(block_hash, "big")
-        if not isinstance(block_hash, int):
-            raise TypeError(
-                f"block_hash must be int or bytes, got {type(block_hash).__name__}"
-            )
-        block_hash_hex = f"{block_hash & ((1 << 64) - 1):016x}"
+        block_hash = get_offload_block_hash(key)
+        block_hash_hex = block_hash[:8].hex()
         subfolder1, subfolder2 = block_hash_hex[:3], block_hash_hex[3:5]
         return f"{self._base_path}/{subfolder1}/{subfolder2}/{block_hash_hex}.bin"
 
-    def _tmp_path(self, dest_path: str, job_id: JobId) -> str:
-        """Return a temp path for atomic writes."""
-        return f"{dest_path}.{job_id}.tmp"
-
-    # ------------------------------------------------------------------
-    # SecondaryTierManager interface
-    # ------------------------------------------------------------------
-
     def set_primary_view(self, view: memoryview) -> None:
         self._primary_view = view
-        self._block_size = view.strides[0]
+        self._block_size = view.strides[0]  # type: ignore
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
-        if key in self._in_flight:
-            return None
-        return key in self._blocks
+    def lookup(self, key: OffloadKey, req_context: ReqContext | None = None) -> bool | None:
+        file_path = self.get_file_name(key)
+        return os.path.exists(file_path)
 
     def submit_store(self, job_metadata: JobMetadata) -> bool:
         """
@@ -401,84 +332,30 @@ class FileSystemTierManagerPython(SecondaryTierManager):
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_store()"
         )
-        spec: CPULoadStoreSpec = job_metadata.spec
-        job_id = job_metadata.job_id
-        all_keys = job_metadata.keys
 
-        # Keep only blocks not yet on disk and not currently being stored.
-        pairs = [
-            (key, int(bid))
-            for key, bid in zip(all_keys, spec.block_ids)
-            if key not in self._blocks and key not in self._in_flight
-        ]
-        if not pairs:
+        # TODO: remove or change tests if decideing to move this check to workers    
+        if all(self.lookup(key) for key in job_metadata.keys):
             return False
-
-        keys_to_store    = [key for key, _   in pairs]
-        block_ids_to_store = [bid for _,  bid in pairs]
-
-        # LRU eviction: free space for the incoming blocks.
-        num_to_evict = len(keys_to_store) - (
-            self._max_blocks - len(self._blocks)
-        )
-        if num_to_evict > 0:
-            if self._evictable_count < num_to_evict:
-                logger.warning(
-                    "FileSystemTierManagerPython(%s): insufficient evictable "
-                    "blocks (%d evictable, %d needed); dropping store job %s.",
-                    self._tier_name,
-                    self._evictable_count,
-                    num_to_evict,
-                    job_id,
-                )
-                return False
-
-            protected = set(all_keys)
-            evicted = [
-                key for key in self._blocks
-                if key not in protected and key not in self._in_flight
-            ][:num_to_evict]
-            if len(evicted) < num_to_evict:
-                logger.warning(
-                    "FileSystemTierManagerPython(%s): could not find %d "
-                    "evictable blocks (protected overlap reduced candidates); "
-                    "dropping store job %s.",
-                    self._tier_name,
-                    num_to_evict,
-                    job_id,
-                )
-                return False
-            for key in evicted:
-                file_path = self.get_file_name(get_offload_block_hash(key))
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
-                del self._blocks[key]
-                self._evictable_count -= 1
 
         # Cast to 1D byte view so os.write receives a flat buffer.
         # The cast shares the same memory as self._primary_view (no copy).
         buffer = self._primary_view.cast("B")
-        state = _JobState(len(keys_to_store))
+        state = _JobState(len(job_metadata.keys))
 
-        for key, bid in zip(keys_to_store, block_ids_to_store):
-            dest_path = self.get_file_name(get_offload_block_hash(key))
-            tmp_path = self._tmp_path(dest_path, job_id)
+        for key, bid in zip(job_metadata.keys, job_metadata.spec.block_ids):
+            dest_path = self.get_file_name(key)
             offset = bid * self._block_size
             self._pool.enqueue_write(
-                functools.partial(_run_store, tmp_path, dest_path, buffer, offset, self._block_size, state)
+                functools.partial(_store_block, dest_path, buffer, offset, self._block_size, state)
             )
 
-        for key in keys_to_store:
-            self._in_flight[key] = job_id
-
-        self._active_jobs[job_id] = _ActiveJob(
+        self._active_jobs[job_metadata.job_id] = _ActiveJob(
             is_store=True,
-            keys=keys_to_store,
+            keys=job_metadata.keys,
             buffer=buffer,
             state=state,
         )
+        # TODO: remove after changing the method to return None after changing the API.
         return True
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
@@ -491,38 +368,21 @@ class FileSystemTierManagerPython(SecondaryTierManager):
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_load()"
         )
-        spec: CPULoadStoreSpec = job_metadata.spec
-        job_id = job_metadata.job_id
         keys = list(job_metadata.keys)
-        block_ids = [int(bid) for bid in spec.block_ids]
-
-        for key in keys:
-            if key not in self._blocks:
-                logger.warning(
-                    "FileSystemTierManagerPython(%s): block %s not found on "
-                    "disk; dropping load job %s.",
-                    self._tier_name,
-                    key,
-                    job_id,
-                )
-                return
+        block_ids = [int(bid) for bid in job_metadata.spec.block_ids]
 
         # Cast to 1D byte view so os.readv receives a flat writable buffer.
         buffer = self._primary_view.cast("B")
         state = _JobState(len(keys))
 
         for key, bid in zip(keys, block_ids):
-            source_path = self.get_file_name(get_offload_block_hash(key))
+            source_path = self.get_file_name(key)
             offset = bid * self._block_size
             self._pool.enqueue_read(
-                functools.partial(_run_load, source_path, buffer, offset, self._block_size, state)
+                functools.partial(_load_block, source_path, buffer, offset, self._block_size, state)
             )
 
-        for key in keys:
-            self._in_flight[key] = job_id
-            self._evictable_count -= 1
-
-        self._active_jobs[job_id] = _ActiveJob(
+        self._active_jobs[job_metadata.job_id] = _ActiveJob(
             is_store=False,
             keys=keys,
             buffer=buffer,
@@ -552,35 +412,9 @@ class FileSystemTierManagerPython(SecondaryTierManager):
             job.buffer.release()
             del self._active_jobs[job_id]
 
-            for key in job.keys:
-                del self._in_flight[key]
-                if job.is_store and success:
-                    self._blocks[key] = True
-                    self._evictable_count += 1
-                elif not job.is_store:
-                    # Load complete (success or failure): block stays in
-                    # _blocks and is no longer in-flight → evictable again.
-                    self._evictable_count += 1
-
             results.append(JobResult(job_id=job_id, success=success))
 
         return results
 
-    def touch(self, keys: Iterable[OffloadKey]) -> None:
-        for key in reversed(list(keys)):
-            if key in self._blocks:
-                self._blocks.move_to_end(key)
-
     def get_tier_name(self) -> str:
         return self._tier_name
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    def get_num_blocks(self) -> int:
-        return len(self._blocks)
-
-    def get_num_in_flight(self) -> int:
-        return len(self._in_flight)
-

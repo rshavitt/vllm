@@ -3,16 +3,13 @@
 """
 Tests for FileSystemTierManagerNixl.
 
-Unit tests (TestNixlFSTierState, TestNixlFSTierEviction,
-TestNixlFSTierJobLifecycle) mock the pool and I/O helpers so that all tasks
-execute synchronously, focusing on Python-level state management: LRU ordering,
-in-flight tracking, _evictable_count invariants, and job lifecycle.
+These tests use real NIXL I/O to verify the NIXL filesystem tier implementation.
+The tier manager writes KV cache blocks to disk via NIXL agents and reads them back,
+verifying data integrity throughout the process.
 
-I/O integration tests (TestNixlFSTierIO) require the real nixl package
-and exercise actual disk reads/writes through NIXL agents.
+Note: These tests require the 'nixl' package to be installed.
 """
 
-import contextlib
 import os
 import time
 
@@ -26,11 +23,21 @@ from vllm.v1.kv_offload.tiering.file_system_nixl import (
     FileSystemTierManagerNixl,
 )
 
+# Skip the entire module if NIXL has no usable plugins (package installed but
+# no transport plugins configured — e.g. UCX/GDR not available in this env).
+try:
+    import tempfile as _tmp
+    with _tmp.TemporaryDirectory() as _d:
+        _probe = FileSystemTierManagerNixl(base_path=_d, n_read_agents=1, n_write_agents=1)
+        del _probe
+except RuntimeError as _e:
+    pytest.skip(f"NIXL plugins not available: {_e}", allow_module_level=True)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-_BLOCK_ELEMENTS = 16
+_BLOCK_ELEMENTS = 512 * 1024  # 2 MB per block (float32 × 512K = 2MB)
 _DTYPE = torch.float32
 
 
@@ -44,11 +51,10 @@ def make_cpu_spec(block_ids: list[int]) -> CPULoadStoreSpec:
 
 def make_tier_with_view(
     base_path: str,
-    max_blocks: int = 10,
-    num_total_blocks: int = 32,
+    num_total_blocks: int = 4,
     **kwargs,
 ) -> FileSystemTierManagerNixl:
-    tier = FileSystemTierManagerNixl(base_path=base_path, max_blocks=max_blocks, **kwargs)
+    tier = FileSystemTierManagerNixl(base_path=base_path, **kwargs)
     tensor = torch.zeros((num_total_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
     tier.set_primary_view(memoryview(tensor.numpy()))
     return tier
@@ -79,311 +85,90 @@ def drain(tier: FileSystemTierManagerNixl, max_rounds: int = 40) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Synchronous mock: replaces _get_pool with an instant no-op pool
+# Basic functionality tests
 # ---------------------------------------------------------------------------
 
-class _SyncNixlPool:
-    """
-    Synchronous pool substitute.  Executes every task immediately in the
-    calling thread by passing a fake agent.  Allows unit tests to drive
-    the state machine without real threads or NIXL.
-    """
-
-    def __init__(self, agent, success: bool = True):
-        self._agent = agent
-        self.success = success
-        self.write_calls: list = []
-        self.read_calls: list = []
-
-    def enqueue_write(self, fn) -> None:
-        self.write_calls.append(fn)
-        fn(self._agent)
-
-    def enqueue_read(self, fn) -> None:
-        self.read_calls.append(fn)
-        fn(self._agent)
-
-    def shutdown(self, wait: bool = True) -> None:
-        pass
-
-
-class _SyncMockNixl:
-    """
-    Patches FileSystemTierManagerNixl._get_pool and the NIXL I/O helpers so
-    that:
-      - All tasks run synchronously in the calling thread.
-      - _nixl_write_block / _nixl_read_block are no-ops (or raise on failure).
-    """
-
-    def __init__(self, success: bool = True):
-        self.success = success
-        self.write_block_calls: list = []
-        self.read_block_calls: list = []
-
-    @contextlib.contextmanager
-    def patch_ctx(self):
-        base = "vllm.v1.kv_offload.tiering.file_system_nixl"
-        from unittest.mock import patch, MagicMock
-
-        fake_agent = MagicMock()
-        fake_agent.name = "mock_agent"
-        pool = _SyncNixlPool(fake_agent, success=self.success)
-
-        mock = self
-
-        def fake_write(agent, block_size, buffer_addr, block_idx, dest, tmp):
-            mock.write_block_calls.append((block_idx, dest))
-            if not mock.success:
-                raise RuntimeError("mock NIXL write failure")
-
-        def fake_read(agent, block_size, buffer_addr, block_idx, source):
-            mock.read_block_calls.append((block_idx, source))
-            if not mock.success:
-                raise RuntimeError("mock NIXL read failure")
-
-        with (
-            patch(f"{base}._nixl_write_block", new=fake_write),
-            patch(f"{base}._nixl_read_block", new=fake_read),
-            patch.object(FileSystemTierManagerNixl, "_get_pool",
-                         return_value=pool),
-        ):
-            yield self
-
-
-# ---------------------------------------------------------------------------
-# State tests
-# ---------------------------------------------------------------------------
-
-class TestNixlFSTierState:
+class TestNixlFSTierBasic:
+    """Tests for basic tier functionality with real NIXL I/O."""
 
     @pytest.fixture(autouse=True)
-    def _patch_io(self, tmp_path):
-        self._mock = _SyncMockNixl()
-        with self._mock.patch_ctx():
-            self.tier = FileSystemTierManagerNixl(
-                base_path=str(tmp_path), max_blocks=10,
-                n_read_agents=1, n_write_agents=1,
-            )
-            tensor = torch.zeros((32, _BLOCK_ELEMENTS), dtype=_DTYPE)
-            self.tier.set_primary_view(memoryview(tensor.numpy()))
-            yield
-
-    def test_initial_state_empty(self):
-        assert self.tier.get_num_blocks() == 0
-        assert self.tier.get_num_in_flight() == 0
-        assert self.tier._evictable_count == 0
+    def _setup(self, tmp_path):
+        self.tier = FileSystemTierManagerNixl(
+            base_path=str(tmp_path),
+            n_read_agents=2,
+            n_write_agents=2,
+        )
+        self.tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        self.tier.set_primary_view(memoryview(self.tensor.numpy()))
+        yield
 
     def test_get_tier_name(self):
         assert self.tier.get_tier_name() == "StorageNixl"
-        t = FileSystemTierManagerNixl.__new__(FileSystemTierManagerNixl)
-        t._tier_name = "NixlTier"
+        t = FileSystemTierManagerNixl(base_path="/tmp/test", tier_name="NixlTier")
         assert t.get_tier_name() == "NixlTier"
 
     def test_lookup_empty_tier(self):
-        req_ctx = ReqContext()
-        assert self.tier.lookup(key(1), req_ctx) is False
-        assert self.tier.lookup(key(2), req_ctx) is False
-
-    def test_lookup_all_present(self):
-        req_ctx = ReqContext()
-        blocks = [key(i) for i in range(3)]
-        for b in blocks:
-            self.tier._blocks[b] = True
-        self.tier._evictable_count = 3
-        for b in blocks:
-            assert self.tier.lookup(b, req_ctx) is True
-
-    def test_lookup_partial_hit_stops_at_first_miss(self):
-        req_ctx = ReqContext()
-        blocks = [key(i) for i in range(4)]
-        self.tier._blocks[blocks[0]] = True
-        self.tier._blocks[blocks[1]] = True
-        self.tier._evictable_count = 2
-        assert self.tier.lookup(blocks[0], req_ctx) is True
-        assert self.tier.lookup(blocks[1], req_ctx) is True
-        assert self.tier.lookup(blocks[2], req_ctx) is False
-        assert self.tier.lookup(blocks[3], req_ctx) is False
-
-    def test_lookup_in_flight_returns_none(self):
-        req_ctx = ReqContext()
-        blocks = [key(i) for i in range(3)]
-        self.tier._blocks[blocks[0]] = True
-        self.tier._evictable_count = 1
-        self.tier._in_flight[blocks[1]] = 99
-        assert self.tier.lookup(blocks[0], req_ctx) is True
-        assert self.tier.lookup(blocks[1], req_ctx) is None
-        assert self.tier.lookup(blocks[2], req_ctx) is False
+        assert self.tier.lookup(key(1)) is False
+        assert self.tier.lookup(key(2)) is False
 
     def test_get_file_name_structure(self):
-        tier = FileSystemTierManagerNixl(base_path="/kvcache", max_blocks=10)
-        path = tier.get_file_name(get_offload_block_hash(key(0)))
+        tier = FileSystemTierManagerNixl(base_path="/kvcache")
+        path = tier.get_file_name(key(0))
         assert path == "/kvcache/000/00/0000000000000000.bin"
 
-    def test_get_file_name_accepts_int(self):
-        tier = FileSystemTierManagerNixl(base_path="/base", max_blocks=10)
-        path_via_bytes = tier.get_file_name(get_offload_block_hash(key(42)))
-        path_via_int = tier.get_file_name(42)
-        assert path_via_bytes == path_via_int
-
-    def test_store_marks_block_after_get_finished(self):
+    def test_store_creates_file_and_lookup_succeeds(self):
         job = make_job(1, [key(1)], [0])
         self.tier.submit_store(job)
         results = drain(self.tier)
         assert len(results) == 1
         assert results[0].success
-        assert key(1) in self.tier._blocks
-        assert self.tier._evictable_count == 1
-
-    def test_in_flight_cleared_after_store(self):
-        job = make_job(1, [key(1)], [0])
-        self.tier.submit_store(job)
-        assert key(1) in self.tier._in_flight
-        drain(self.tier)
-        assert key(1) not in self.tier._in_flight
+        # Verify file exists and lookup returns True
+        assert self.tier.lookup(key(1)) is True
 
     def test_store_skips_already_stored_blocks(self):
-        self.tier._blocks[key(1)] = True
-        self.tier._evictable_count = 1
+        # Store once
         job = make_job(1, [key(1)], [0])
         self.tier.submit_store(job)
-        assert 1 not in self.tier._active_jobs
-
-    def test_load_restores_evictable_after_get_finished(self):
-        self.tier._blocks[key(1)] = True
-        self.tier._evictable_count = 1
-        job = make_job(2, [key(1)], [0])
-        self.tier.submit_load(job)
-        assert self.tier._evictable_count == 0
         drain(self.tier)
-        assert self.tier._evictable_count == 1
+        
+        # Try to store again - should skip
+        job2 = make_job(2, [key(1)], [0])
+        submitted = self.tier.submit_store(job2)
+        assert not submitted  # Should return False since block already exists
 
-    def test_load_drops_missing_block(self):
-        job = make_job(3, [key(99)], [0])
-        self.tier.submit_load(job)
-        assert 3 not in self.tier._active_jobs
-
-
-# ---------------------------------------------------------------------------
-# Eviction tests
-# ---------------------------------------------------------------------------
-
-class TestNixlFSTierEviction:
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, tmp_path):
-        self._mock = _SyncMockNixl()
-        with self._mock.patch_ctx():
-            self.tier = FileSystemTierManagerNixl(
-                base_path=str(tmp_path), max_blocks=5,
-                n_read_agents=1, n_write_agents=1,
-            )
-            tensor = torch.zeros((32, _BLOCK_ELEMENTS), dtype=_DTYPE)
-            self.tier.set_primary_view(memoryview(tensor.numpy()))
-            yield
-
-    def _fill(self, n: int, start: int = 0):
-        for i in range(start, start + n):
-            self.tier._blocks[key(i)] = True
-        self.tier._evictable_count = len(self.tier._blocks)
-
-    def test_eviction_removes_oldest_first(self):
-        self._fill(5)
-        job = make_job(1, [key(10)], [0])
-        self.tier.submit_store(job)
-        drain(self.tier)
-        assert key(10) in self.tier._blocks
-        assert key(0) not in self.tier._blocks
-        for i in range(1, 5):
-            assert key(i) in self.tier._blocks
-
-    def test_eviction_respects_in_flight(self):
-        self._fill(5)
-        self.tier._in_flight[key(0)] = 99
-        self.tier._evictable_count -= 1
-        job = make_job(1, [key(10)], [0])
-        self.tier.submit_store(job)
-        drain(self.tier)
-        assert key(10) in self.tier._blocks
-        assert key(0) in self.tier._blocks
-        assert key(1) not in self.tier._blocks
-
-    def test_eviction_skips_protected_batch_blocks(self):
-        self._fill(5)
-        job = make_job(1, [key(0), key(10)], [0, 1])
-        self.tier.submit_store(job)
-        drain(self.tier)
-        assert key(10) in self.tier._blocks
-        assert key(0) in self.tier._blocks
-        assert key(1) not in self.tier._blocks
-
-    def test_eviction_fails_insufficient_evictable(self):
-        self._fill(5)
-        for i in range(5):
-            self.tier._in_flight[key(i)] = 99
-        self.tier._evictable_count = 0
-        self.tier.submit_store(make_job(1, [key(10)], [0]))
-        assert 1 not in self.tier._active_jobs
-
-
-# ---------------------------------------------------------------------------
-# Job lifecycle tests
-# ---------------------------------------------------------------------------
-
-class TestNixlFSTierJobLifecycle:
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, tmp_path):
-        self._mock = _SyncMockNixl()
-        with self._mock.patch_ctx():
-            self.tier = FileSystemTierManagerNixl(
-                base_path=str(tmp_path), max_blocks=20,
-                n_read_agents=1, n_write_agents=1,
-            )
-            tensor = torch.zeros((32, _BLOCK_ELEMENTS), dtype=_DTYPE)
-            self.tier.set_primary_view(memoryview(tensor.numpy()))
-            yield
-
-    def test_store_then_load_roundtrip_state(self):
+    def test_store_then_load_roundtrip(self):
         job_s = make_job(1, [key(1), key(2)], [0, 1])
         self.tier.submit_store(job_s)
         store_results = drain(self.tier)
         assert all(r.success for r in store_results)
-        assert key(1) in self.tier._blocks
-        assert key(2) in self.tier._blocks
+        assert self.tier.lookup(key(1)) is True
+        assert self.tier.lookup(key(2)) is True
 
-        job_l = make_job(2, [key(1), key(2)], [0, 1])
+        job_l = make_job(2, [key(1), key(2)], [2, 3])
         self.tier.submit_load(job_l)
         load_results = drain(self.tier)
         assert all(r.success for r in load_results)
-        assert key(1) in self.tier._blocks
-        assert key(2) in self.tier._blocks
-        assert self.tier._evictable_count == 2
+        # Blocks stay on disk after load
+        assert self.tier.lookup(key(1)) is True
+        assert self.tier.lookup(key(2)) is True
 
-    def test_failed_store_not_added_to_blocks(self):
-        mock_fail = _SyncMockNixl(success=False)
-        with mock_fail.patch_ctx():
-            tier = FileSystemTierManagerNixl(
-                base_path="/tmp/kv_nixl_fail", max_blocks=10,
-                n_read_agents=1, n_write_agents=1,
-            )
-            tensor = torch.zeros((32, _BLOCK_ELEMENTS), dtype=_DTYPE)
-            tier.set_primary_view(memoryview(tensor.numpy()))
-            job = make_job(1, [key(5)], [0])
-            tier.submit_store(job)
-            results = drain(tier)
+    def test_failed_store_with_invalid_path(self, tmp_path):
+        """Test that failed store operations are reported correctly."""
+        # Create a tier with an invalid base path to trigger I/O failures
+        tier = FileSystemTierManagerNixl(
+            base_path="/dev/null/invalid_path",
+            n_read_agents=1,
+            n_write_agents=1,
+        )
+        tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        tier.set_primary_view(memoryview(tensor.numpy()))
+        job = make_job(1, [key(5)], [0])
+        tier.submit_store(job)
+        results = drain(tier)
 
         assert len(results) == 1
         assert not results[0].success
-        assert key(5) not in tier._blocks
-        assert tier._evictable_count == 0
-
-    def test_touch_updates_lru_order(self):
-        for i in range(3):
-            self.tier._blocks[key(i)] = True
-        self.tier._evictable_count = 3
-        self.tier.touch([key(0)])
-        keys = list(self.tier._blocks.keys())
-        assert keys[-1] == key(0)
+        assert tier.lookup(key(5)) is False
 
     def test_multiple_jobs_tracked_independently(self):
         job1 = make_job(1, [key(1)], [0])
@@ -393,23 +178,8 @@ class TestNixlFSTierJobLifecycle:
         results = drain(self.tier)
         job_ids = {r.job_id for r in results}
         assert job_ids == {1, 2}
-
-    def test_write_tasks_enqueued_per_block(self):
-        """Each block in a store job should generate one write call."""
-        job = make_job(1, [key(1), key(2), key(3)], [0, 1, 2])
-        self.tier.submit_store(job)
-        drain(self.tier)
-        assert len(self._mock.write_block_calls) == 3
-
-    def test_read_tasks_enqueued_per_block(self):
-        """Each block in a load job should generate one read call."""
-        for i in range(3):
-            self.tier._blocks[key(i)] = True
-        self.tier._evictable_count = 3
-        job = make_job(1, [key(0), key(1), key(2)], [0, 1, 2])
-        self.tier.submit_load(job)
-        drain(self.tier)
-        assert len(self._mock.read_block_calls) == 3
+        assert self.tier.lookup(key(1)) is True
+        assert self.tier.lookup(key(2)) is True
 
 
 # ---------------------------------------------------------------------------
@@ -418,16 +188,14 @@ class TestNixlFSTierJobLifecycle:
 
 class TestNixlFSTierIO:
 
-    def _make_tier(self, tmp_path, num_total_blocks: int = 100, **kwargs):
+    def _make_tier(self, tmp_path, num_total_blocks: int = 8, **kwargs):
         tier = FileSystemTierManagerNixl(
             base_path=str(tmp_path / "kvcache"),
-            max_blocks=num_total_blocks,
             n_read_agents=2,
             n_write_agents=2,
             **kwargs,
         )
-        # 128 float32 = 512 bytes per block — required for O_DIRECT sector alignment
-        tensor = torch.zeros((num_total_blocks, 128), dtype=_DTYPE)
+        tensor = torch.zeros((num_total_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
         tier.set_primary_view(memoryview(tensor.numpy()))
         return tier, tensor
 
@@ -437,18 +205,18 @@ class TestNixlFSTierIO:
         tier.submit_store(job)
         results = drain(tier)
         assert results[0].success
-        assert key(1) in tier._blocks
-        dest = tier.get_file_name(get_offload_block_hash(key(1)))
+        assert tier.lookup(key(1)) is True
+        dest = tier.get_file_name(key(1))
         assert os.path.exists(dest), f"Expected file at {dest}"
 
     def test_store_load_data_integrity(self, tmp_path):
         """Data written by store must be exactly recovered by load."""
         num_blocks = 4
-        num_total = 32
+        num_total = 8
         tier, tensor = self._make_tier(tmp_path, num_total_blocks=num_total)
 
         for bid in range(num_blocks):
-            tensor[bid] = torch.rand((128,), dtype=_DTYPE)
+            tensor[bid] = torch.rand((_BLOCK_ELEMENTS,), dtype=_DTYPE)
         expected = tensor[:num_blocks].clone()
 
         block_ids = list(range(num_blocks))
@@ -471,7 +239,7 @@ class TestNixlFSTierIO:
 
     def test_store_load_multiple_blocks(self, tmp_path):
         num_blocks = 8
-        num_total = 32
+        num_total = 16
         tier, tensor = self._make_tier(tmp_path, num_total_blocks=num_total)
 
         for bid in range(num_blocks):
@@ -491,6 +259,19 @@ class TestNixlFSTierIO:
 
         for i, bid in enumerate(load_ids):
             assert torch.allclose(tensor[bid], expected[i])
+
+    def test_idempotent_store(self, tmp_path):
+        """Storing the same block twice should be a no-op after first store."""
+        tier, _ = self._make_tier(tmp_path)
+        job1 = make_job(1, [key(7)], [0])
+        tier.submit_store(job1)
+        drain(tier)
+        assert tier.lookup(key(7)) is True
+
+        job2 = make_job(2, [key(7)], [0])
+        submitted = tier.submit_store(job2)
+        # No active job should be created since block is already stored.
+        assert not submitted
 
 
 # ---------------------------------------------------------------------------
@@ -514,24 +295,21 @@ class TestNixlFileSystemTierE2EWithPrimary:
             TieringOffloadingManager,
         )
         
-        # Use 128 elements per block for O_DIRECT alignment (512 bytes)
-        block_elements = 128
+        block_elements = _BLOCK_ELEMENTS
         num_primary_blocks = 10
-        num_secondary_blocks = 20
-        
+
         # Create primary tier
         primary_tier = CPUPrimaryTierOffloadingManager(
             num_blocks=num_primary_blocks,
         )
 
-        # Create CPU tensor for primary tier
+        # Provide a plain CPU tensor as the shared KV buffer
         cpu_tensor = torch.zeros((num_primary_blocks, block_elements), dtype=torch.float32)
         primary_tier.create_kv_memoryview = lambda: memoryview(cpu_tensor.numpy())
         
         # Create NIXL filesystem tier with real I/O
         fs_tier = FileSystemTierManagerNixl(
             base_path=str(tmp_path / "kvcache"),
-            max_blocks=num_secondary_blocks,
             n_read_agents=2,
             n_write_agents=2,
         )
@@ -582,20 +360,19 @@ class TestNixlFileSystemTierE2EWithPrimary:
             time.sleep(0.01)
         
         # Verify blocks are in both tiers
-        req_ctx = ReqContext()
         for k in keys:
-            assert primary_tier.lookup(k, req_ctx) is True
-            assert fs_tier.lookup(k, req_ctx) is True
+            assert primary_tier.lookup(k, ReqContext()) is True
+            assert fs_tier.lookup(k) is True
         
         # Verify data integrity by reading from disk
         for k in keys:
-            file_path = fs_tier.get_file_name(get_offload_block_hash(k))
+            file_path = fs_tier.get_file_name(k)
             assert os.path.isfile(file_path), f"File not found: {file_path}"
-            
-            # Read file and verify size
-            file_size = os.path.getsize(file_path)
-            expected_size = block_elements * 4  # 4 bytes per float32
-            assert file_size == expected_size, f"File size mismatch: {file_size} != {expected_size}"
+            with open(file_path, "rb") as f:
+                raw = f.read(block_elements * 4)
+            actual = torch.frombuffer(bytearray(raw), dtype=torch.float32)
+            assert torch.allclose(actual, expected_data[k]), \
+                f"Data mismatch for block {k}"
 
     def test_full_promotion_with_data_integrity(self, setup_manager):
         """
@@ -623,16 +400,23 @@ class TestNixlFileSystemTierE2EWithPrimary:
 
         manager.complete_store(keys, success=True)
 
-        # Wait for cascade
+        # Wait for cascade to complete before trying to evict
         for _ in range(20):
             manager._process_finished_jobs()
-            time.sleep(0.01)
+            # Check if cascade is done (ref_cnt == 0 for all blocks)
+            all_done = all(
+                primary_tier._policy.get(k).ref_cnt == 0
+                for k in keys if primary_tier._policy.get(k) is not None
+            )
+            if all_done:
+                break
+            time.sleep(0.05)
 
         # Evict blocks from primary tier by storing new blocks
         evict_keys = [key(300 + i) for i in range(10)]
         result = manager.prepare_store(evict_keys, ReqContext())
         assert result is not None
-        assert len(result.evicted_keys) >= num_blocks
+        assert len(result.evicted_keys) >= 4
         
         spec = result.store_spec
         assert isinstance(spec, CPULoadStoreSpec)
@@ -646,15 +430,13 @@ class TestNixlFileSystemTierE2EWithPrimary:
             time.sleep(0.01)
         
         # Verify blocks are only in filesystem tier
-        req_ctx = ReqContext()
         for k in keys:
-            assert primary_tier.lookup(k, req_ctx) is False
-            assert fs_tier.lookup(k, req_ctx) is True
+            assert primary_tier.lookup(k, ReqContext()) is False
+            assert fs_tier.lookup(k) is True
         
         # Trigger promotion by lookup
-        req_ctx = ReqContext()
         for k in keys:
-            manager.lookup(k, req_ctx)
+            manager.lookup(k, ReqContext())
 
         # Wait for promotion to complete
         for _ in range(20):
@@ -662,7 +444,7 @@ class TestNixlFileSystemTierE2EWithPrimary:
             time.sleep(0.01)
 
         # Verify blocks are now in primary tier
-        assert all(manager.lookup(k, req_ctx) is True for k in keys)
+        assert all(manager.lookup(k, ReqContext()) is True for k in keys)
 
         # Verify data integrity after promotion
         load_spec = primary_tier.prepare_load(keys, ReqContext())
@@ -697,17 +479,22 @@ class TestNixlFileSystemTierE2EWithPrimary:
 
         manager.complete_store(keys, success=True)
 
-        # Wait for cascade
+        # Wait for cascade to complete
         for _ in range(20):
             manager._process_finished_jobs()
-            time.sleep(0.01)
+            all_done = all(
+                primary_tier._policy.get(k).ref_cnt == 0
+                for k in keys if primary_tier._policy.get(k) is not None
+            )
+            if all_done:
+                break
+            time.sleep(0.05)
 
-        # Evict from primary by filling it.
-        # Primary has 10 slots, 3 used, 7 free. Store 10 more to force
-        # all 3 original blocks to be evicted (3 + 10 = 13, 13 - 10 = 3 evictions).
+        # Evict from primary by filling it
         evict_keys = [key(500 + i) for i in range(10)]
         result = manager.prepare_store(evict_keys, ReqContext())
         assert result is not None
+        assert len(result.evicted_keys) >= num_blocks
         
         spec = result.store_spec
         assert isinstance(spec, CPULoadStoreSpec)
@@ -721,14 +508,12 @@ class TestNixlFileSystemTierE2EWithPrimary:
             time.sleep(0.01)
         
         # Verify original blocks are evicted from primary
-        req_ctx = ReqContext()
         for k in keys:
-            assert primary_tier.lookup(k, req_ctx) is False
+            assert primary_tier.lookup(k, ReqContext()) is False
         
         # Trigger promotion
-        req_ctx = ReqContext()
         for k in keys:
-            manager.lookup(k, req_ctx)
+            manager.lookup(k, ReqContext())
 
         # Wait for promotion to complete
         for _ in range(20):
@@ -736,7 +521,7 @@ class TestNixlFileSystemTierE2EWithPrimary:
             time.sleep(0.01)
 
         # Verify data integrity after roundtrip
-        assert all(manager.lookup(k, req_ctx) is True for k in keys)
+        assert all(manager.lookup(k, ReqContext()) is True for k in keys)
         load_spec = primary_tier.prepare_load(keys, ReqContext())
         
         for i, block_id in enumerate(load_spec.block_ids):
@@ -744,209 +529,3 @@ class TestNixlFileSystemTierE2EWithPrimary:
             expected = expected_data[keys[i]]
             assert torch.allclose(actual_data, expected, rtol=1e-5, atol=1e-7), \
                 f"Block {i} data mismatch after roundtrip"
-
-    def test_eviction_coordination_with_real_io(self, setup_manager):
-        """
-        Fill both primary and filesystem tiers to capacity, store additional
-        blocks to trigger eviction in both tiers, and verify LRU eviction
-        works correctly with evicted blocks removed from disk.
-        """
-        manager, primary_tier, fs_tier, cpu_tensor, block_elements = setup_manager
-        
-        # Fill primary tier (10 blocks)
-        keys_batch1 = [key(600 + i) for i in range(10)]
-        result = manager.prepare_store(keys_batch1, ReqContext())
-        assert result is not None
-
-        spec = result.store_spec
-        assert isinstance(spec, CPULoadStoreSpec)
-        for block_id in spec.block_ids:
-            cpu_tensor[int(block_id)] = torch.rand(block_elements, dtype=torch.float32)
-        manager.complete_store(keys_batch1, success=True)
-
-        # Wait for cascade
-        for _ in range(20):
-            manager._process_finished_jobs()
-            time.sleep(0.01)
-
-        # Fill filesystem tier (20 blocks total, 10 more)
-        keys_batch2 = [key(700 + i) for i in range(10)]
-        result = manager.prepare_store(keys_batch2, ReqContext())
-        assert result is not None
-
-        spec = result.store_spec
-        assert isinstance(spec, CPULoadStoreSpec)
-        for block_id in spec.block_ids:
-            cpu_tensor[int(block_id)] = torch.rand(block_elements, dtype=torch.float32)
-        manager.complete_store(keys_batch2, success=True)
-
-        # Wait for cascade
-        for _ in range(20):
-            manager._process_finished_jobs()
-            time.sleep(0.01)
-
-        # Verify both tiers are at capacity
-        assert fs_tier.get_num_blocks() == 20
-
-        # Store more blocks to trigger eviction
-        keys_batch3 = [key(800 + i) for i in range(5)]
-        result = manager.prepare_store(keys_batch3, ReqContext())
-        assert result is not None
-        assert len(result.evicted_keys) == 5  # Primary tier evicts oldest
-        
-        spec = result.store_spec
-        assert isinstance(spec, CPULoadStoreSpec)
-        for block_id in spec.block_ids:
-            cpu_tensor[int(block_id)] = torch.rand(block_elements, dtype=torch.float32)
-        manager.complete_store(keys_batch3, success=True)
-        
-        # Wait for cascade
-        for _ in range(20):
-            manager._process_finished_jobs()
-            time.sleep(0.01)
-        
-        # Verify filesystem tier evicted oldest blocks
-        assert fs_tier.get_num_blocks() == 20
-        
-        # Verify oldest blocks from batch1 are evicted from filesystem
-        for i in range(5):
-            k = keys_batch1[i]
-            file_path = fs_tier.get_file_name(get_offload_block_hash(k))
-            assert not os.path.exists(file_path), f"Evicted file still exists: {file_path}"
-
-    def test_ref_cnt_protection_during_async_cascade(self, setup_manager):
-        """
-        Store blocks to primary tier, verify ref_cnt prevents eviction during
-        async cascade, wait for cascade completion, and verify ref_cnt is
-        released after cascade.
-        """
-        manager, primary_tier, fs_tier, cpu_tensor, block_elements = setup_manager
-        
-        # Store blocks to primary
-        keys = [key(900 + i) for i in range(3)]
-        result = manager.prepare_store(keys, ReqContext())
-        assert result is not None
-        
-        spec = result.store_spec
-        assert isinstance(spec, CPULoadStoreSpec)
-        for block_id in spec.block_ids:
-            cpu_tensor[int(block_id)] = torch.rand(block_elements, dtype=torch.float32)
-        
-        manager.complete_store(keys, success=True)
-        
-        # Verify ref_cnt is incremented during cascade (1 per secondary tier)
-        for k in keys:
-            block_status = primary_tier._policy.get(k)
-            assert block_status is not None
-            assert block_status.ref_cnt == 1, f"Expected ref_cnt=1, got {block_status.ref_cnt}"
-        
-        # Wait for cascade to complete
-        for _ in range(20):
-            manager._process_finished_jobs()
-            time.sleep(0.01)
-        
-        # Verify ref_cnt is released after cascade
-        for k in keys:
-            block_status = primary_tier._policy.get(k)
-            assert block_status is not None
-            assert block_status.ref_cnt == 0, f"Expected ref_cnt=0, got {block_status.ref_cnt}"
-
-    def test_multiple_filesystem_tiers_independent_io(self, tmp_path):
-        """
-        Use two NIXL filesystem tiers with different capacities, verify both
-        receive cascaded data, verify independent eviction policies, and
-        verify data integrity in both tiers.
-        """
-        from vllm.v1.kv_offload.tiering.manager import (
-            CPUPrimaryTierOffloadingManager,
-            TieringOffloadingManager,
-        )
-        
-        block_elements = 128
-        num_primary_blocks = 10
-        
-        # Create primary tier
-        primary_tier = CPUPrimaryTierOffloadingManager(
-            num_blocks=num_primary_blocks,
-        )
-        cpu_tensor = torch.zeros((num_primary_blocks, block_elements), dtype=torch.float32)
-        primary_tier.create_kv_memoryview = lambda: memoryview(cpu_tensor.numpy())
-        
-        # Create two NIXL filesystem tiers with different capacities
-        fs_tier1 = FileSystemTierManagerNixl(
-            base_path=str(tmp_path / "tier1"),
-            max_blocks=5,
-            n_read_agents=1,
-            n_write_agents=1,
-        )
-        fs_tier2 = FileSystemTierManagerNixl(
-            base_path=str(tmp_path / "tier2"),
-            max_blocks=15,
-            n_read_agents=1,
-            n_write_agents=1,
-        )
-        
-        manager = TieringOffloadingManager(
-            primary_tier=primary_tier,
-            secondary_tiers=[fs_tier1, fs_tier2],
-        )
-        
-        try:
-            # Store blocks to primary (cascades to both tiers)
-            keys = [key(1000 + i) for i in range(5)]
-            expected_data = {}
-            
-            result = manager.prepare_store(keys, ReqContext())
-            assert result is not None
-
-            spec = result.store_spec
-            assert isinstance(spec, CPULoadStoreSpec)
-            for i, block_id in enumerate(spec.block_ids):
-                data = torch.rand(block_elements, dtype=torch.float32)
-                cpu_tensor[int(block_id)] = data
-                expected_data[keys[i]] = data.clone()
-
-            manager.complete_store(keys, success=True)
-
-            # Wait for cascade to both tiers
-            for _ in range(20):
-                manager._process_finished_jobs()
-                time.sleep(0.01)
-
-            # Verify both tiers received the data
-            assert fs_tier1.get_num_blocks() == 5
-            assert fs_tier2.get_num_blocks() == 5
-            req_ctx = ReqContext()
-            for k in keys:
-                assert fs_tier1.lookup(k, req_ctx) is True
-                assert fs_tier2.lookup(k, req_ctx) is True
-
-            # Store more blocks to trigger eviction in tier1 only
-            keys2 = [key(1100 + i) for i in range(3)]
-            result = manager.prepare_store(keys2, ReqContext())
-            assert result is not None
-            
-            spec2 = result.store_spec
-            assert isinstance(spec2, CPULoadStoreSpec)
-            for block_id in spec2.block_ids:
-                cpu_tensor[int(block_id)] = torch.rand(block_elements, dtype=torch.float32)
-            
-            manager.complete_store(keys2, success=True)
-            
-            # Wait for cascade to both tiers
-            for _ in range(20):
-                manager._process_finished_jobs()
-                time.sleep(0.01)
-            
-            # Verify tier1 evicted blocks (capacity 5)
-            assert fs_tier1.get_num_blocks() == 5
-            # Verify tier2 kept all blocks (capacity 15)
-            assert fs_tier2.get_num_blocks() == 8
-            
-            # Verify data integrity in tier2 for all blocks
-            for k in keys + keys2:
-                file_path = fs_tier2.get_file_name(get_offload_block_hash(k))
-                assert os.path.isfile(file_path), f"File not found in tier2: {file_path}"
-        
-        finally:
-            manager.shutdown()

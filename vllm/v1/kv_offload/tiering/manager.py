@@ -315,8 +315,6 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Blocks to mark as recently used.
         """
         self.primary_tier.touch(keys)
-        for tier in self.secondary_tiers:
-            tier.touch(keys)
 
     def complete_load(self, keys: Collection[OffloadKey]):
         """

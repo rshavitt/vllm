@@ -3,10 +3,6 @@
 """
 FileSystemTierManagerNixl: NIXL-backed disk secondary tier for KV cache offloading.
 
-Mirrors the structure of FileSystemTierManager (C++ tier) exactly — same file layout,
-LRU tracking, in-flight state, and job lifecycle — but performs I/O via NIXL agents
-using the POSIX backend instead of a C++ extension.
-
 Thread pool:
     Two queues (read, write) and two sets of threads:
       - Read-priority threads: drain the read queue first, then the write queue.
@@ -16,7 +12,8 @@ Thread pool:
 
 Store path:
     Each block is written atomically via a NIXL WRITE transfer:
-    data is transferred to a temp file, then os.replace'd to the final path.
+    data is transferred to a temp file (<dest_path_with_.tmp_instead_of_.bin>),
+    then os.replace'd to the final path.
 
 Load path:
     Each block is read from disk into the CPU buffer via a NIXL READ transfer.
@@ -24,13 +21,12 @@ Load path:
 File naming:  <base_path>/<hhh>/<hh>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
 
-NIXL agents and the thread pool are created lazily on first use.
+NIXL agents and the thread pool are created eagerly during initialization.
 """
 
 import collections
 import os
 import threading
-from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -73,8 +69,9 @@ class _NixlDualQueuePool:
     Each thread is assigned a dedicated NIXL agent at creation time and passes
     it to every task it runs (NIXL agents are not thread-safe).
 
-    Tasks submitted to this pool must accept a single positional argument:
-        task(agent) -> None
+    Tasks submitted to this pool must accept two positional arguments:
+        task(agent, dram_handle) -> None
+    where dram_handle is the pre-registered DRAM memory handle for that agent.
     """
 
     def __init__(
@@ -89,14 +86,19 @@ class _NixlDualQueuePool:
         self._cv = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
+        
+        # Store agents and their DRAM handles (set later via register_dram_buffer)
+        self._agents: list = []
+        self._dram_handles: list = []
 
         # Create all agents upfront so each thread gets its own.
         agents = [make_agent(i) for i in range(n_read_prio + n_write_prio)]
+        self._agents = agents
 
         for i in range(n_read_prio):
             t = threading.Thread(
                 target=self._worker,
-                args=(True, agents[i]),
+                args=(True, i),
                 name=f"{thread_name_prefix}_r{i}",
                 daemon=True,
             )
@@ -106,7 +108,7 @@ class _NixlDualQueuePool:
         for i in range(n_write_prio):
             t = threading.Thread(
                 target=self._worker,
-                args=(False, agents[n_read_prio + i]),
+                args=(False, n_read_prio + i),
                 name=f"{thread_name_prefix}_w{i}",
                 daemon=True,
             )
@@ -125,6 +127,20 @@ class _NixlDualQueuePool:
             self._write_q.append(fn)
             self._cv.notify()
 
+    def register_dram_buffer(self, view_addr: int, view_size: int) -> None:
+        """
+        Register the DRAM buffer with all agents. Must be called after pool
+        creation but before any tasks are enqueued.
+        """
+        self._dram_handles = []
+        for agent in self._agents:
+            dram_handle = agent.register_memory(
+                [(view_addr, view_size, 0, "")],
+                mem_type="DRAM",
+                backends=["POSIX"]
+            )
+            self._dram_handles.append(dram_handle)
+
     def shutdown(self, wait: bool = True) -> None:
         with self._cv:
             self._stop = True
@@ -132,8 +148,17 @@ class _NixlDualQueuePool:
         if wait:
             for t in self._threads:
                 t.join()
+        
+        # Deregister DRAM handles on shutdown
+        for agent, dram_handle in zip(self._agents, self._dram_handles):
+            if dram_handle is not None:
+                try:
+                    agent.deregister_memory(dram_handle)
+                except Exception:
+                    pass
 
-    def _worker(self, read_priority: bool, agent) -> None:
+    def _worker(self, read_priority: bool, agent_idx: int) -> None:
+        agent = self._agents[agent_idx]
         while True:
             with self._cv:
                 self._cv.wait_for(
@@ -144,7 +169,10 @@ class _NixlDualQueuePool:
                 primary   = self._read_q  if read_priority else self._write_q
                 secondary = self._write_q if read_priority else self._read_q
                 task = primary.popleft() if primary else secondary.popleft()
-            task(agent)
+            
+            # Pass both agent and its pre-registered DRAM handle to the task
+            dram_handle = self._dram_handles[agent_idx] if self._dram_handles else None
+            task(agent, dram_handle)
 
 
 # ---------------------------------------------------------------------------
@@ -201,40 +229,47 @@ def _memview_addr(view: memoryview) -> int:
 
 
 # ---------------------------------------------------------------------------
-# NIXL I/O helpers
+# Per-block NIXL I/O callbacks — module-level so they are not re-created each loop
 # ---------------------------------------------------------------------------
 
-def _nixl_write_block(
+def _run_nixl_store(
     agent,
+    dram_handle,
     block_size: int,
-    buffer_addr: int,
+    view_addr: int,
     block_idx: int,
-    dest_fname: str,
-    tmp_fname: str,
+    dest_path: str,
+    state: "_JobState",
 ) -> None:
     """
-    Write one KV block at *buffer_addr + block_idx * block_size* to *dest_fname*
-    via a NIXL WRITE transfer, using *tmp_fname* for atomic rename.
+    Store callback: write one KV block via NIXL WRITE transfer.
+    
+    Writes to a temp file then atomically replaces the destination.
+    Checks if block exists first to avoid redundant writes.
+    Uses pre-registered DRAM handle to avoid repeated registration overhead.
     """
+    tmp_fname = dest_path.replace('.bin', '.tmp')
     fd = -1
     xfer_handle = None
     file_handle = None
-    dram_handle = None
     try:
-        os.makedirs(os.path.dirname(dest_fname), exist_ok=True)
+        # Check if block already exists to avoid redundant writes
+        if os.path.exists(dest_path):
+            state.task_done(True)
+            return
+            
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         fd = os.open(
             tmp_fname,
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT,
             0o644,
         )
 
-        block_addr = buffer_addr + block_idx * block_size
+        block_addr = view_addr + block_idx * block_size
         local_descs = [(block_addr, block_size, 0)]
         remote_descs = [(0, block_size, fd, "")]
 
-        dram_handle = agent.register_memory(
-            [(block_addr, block_size, 0, "")], mem_type="DRAM", backends=["POSIX"]
-        )
+        # Use pre-registered DRAM handle instead of registering again
         local_dl = agent.get_xfer_descs(local_descs, mem_type="DRAM")
         file_handle = agent.register_memory(
             remote_descs, mem_type="FILE", backends=["POSIX"]
@@ -249,26 +284,26 @@ def _nixl_write_block(
         agent.transfer(xfer_handle)
 
         while True:
-            state = agent.check_xfer_state(xfer_handle)
-            if state == "DONE":
+            xfer_state = agent.check_xfer_state(xfer_handle)
+            if xfer_state == "DONE":
                 break
-            if state == "ERR":
+            if xfer_state == "ERR":
                 raise RuntimeError(
-                    f"NIXL WRITE transfer failed for block {block_idx} "
-                    f"-> {dest_fname}"
+                    f"NIXL WRITE transfer failed for block {block_idx} -> {dest_path}"
                 )
 
         os.close(fd)
         fd = -1
-        os.replace(tmp_fname, dest_fname)
+        os.replace(tmp_fname, dest_path)
+        state.task_done(True)
 
-    except Exception:
+    except Exception as exc:
         if fd >= 0:
             try:
                 os.close(fd)
             except OSError:
                 pass
-        raise
+        state.task_done(False, exc)
     finally:
         if xfer_handle is not None:
             agent.release_xfer_handle(xfer_handle)
@@ -278,31 +313,30 @@ def _nixl_write_block(
             agent.deregister_memory(dram_handle)
 
 
-def _nixl_read_block(
+def _run_nixl_load(
     agent,
+    dram_handle,
     block_size: int,
-    buffer_addr: int,
+    view_addr: int,
     block_idx: int,
-    source_fname: str,
+    source_path: str,
+    state: "_JobState",
 ) -> None:
     """
-    Read one KV block from *source_fname* into the buffer at
-    *buffer_addr + block_idx * block_size* via a NIXL READ transfer.
+    Load callback: read one KV block via NIXL READ transfer.
+    Uses pre-registered DRAM handle to avoid repeated registration overhead.
     """
     fd = -1
     xfer_handle = None
     file_handle = None
-    dram_handle = None
     try:
-        fd = os.open(source_fname, os.O_RDONLY | os.O_DIRECT)
+        fd = os.open(source_path, os.O_RDONLY | os.O_DIRECT)
 
-        block_addr = buffer_addr + block_idx * block_size
+        block_addr = view_addr + block_idx * block_size
         local_descs = [(block_addr, block_size, 0)]
         remote_descs = [(0, block_size, fd, "")]
 
-        dram_handle = agent.register_memory(
-            [(block_addr, block_size, 0, "")], mem_type="DRAM", backends=["POSIX"]
-        )
+        # Use pre-registered DRAM handle instead of registering again
         local_dl = agent.get_xfer_descs(local_descs, mem_type="DRAM")
         file_handle = agent.register_memory(
             remote_descs, mem_type="FILE", backends=["POSIX"]
@@ -317,32 +351,30 @@ def _nixl_read_block(
         agent.transfer(xfer_handle)
 
         while True:
-            state = agent.check_xfer_state(xfer_handle)
-            if state == "DONE":
+            xfer_state = agent.check_xfer_state(xfer_handle)
+            if xfer_state == "DONE":
                 break
-            if state == "ERR":
+            if xfer_state == "ERR":
                 raise RuntimeError(
-                    f"NIXL READ transfer failed for block {block_idx} "
-                    f"<- {source_fname}"
+                    f"NIXL READ transfer failed for block {block_idx} <- {source_path}"
                 )
 
         os.close(fd)
         fd = -1
+        state.task_done(True)
 
-    except Exception:
+    except Exception as exc:
         if fd >= 0:
             try:
                 os.close(fd)
             except OSError:
                 pass
-        raise
+        state.task_done(False, exc)
     finally:
         if xfer_handle is not None:
             agent.release_xfer_handle(xfer_handle)
         if file_handle is not None:
             agent.deregister_memory(file_handle)
-        if dram_handle is not None:
-            agent.deregister_memory(dram_handle)
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +386,7 @@ class _ActiveJob:
     """A job whose per-block tasks have been enqueued in the thread pool."""
     is_store: bool
     keys: list[OffloadKey]
-    buffer: memoryview  # kept alive until state.is_done
+    view: memoryview  # kept alive until state.is_done
     state: _JobState
 
 
@@ -366,73 +398,52 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
     """
     NIXL-backed disk secondary tier.
 
-    Mirrors FileSystemTierManager (C++ tier) in structure: same file naming,
-    LRU eviction, in-flight tracking, and job lifecycle.  I/O is performed via
-    NIXL agents using the POSIX backend, one task per block file.
-
     Read-priority threads service load jobs preferentially; write-priority
     threads service store jobs preferentially.  Both groups can drain either
     queue, so neither starves.  Each thread holds a dedicated NIXL agent.
 
-    The thread pool and agents are initialised lazily on first store/load call.
+    The thread pool and agents are initialized eagerly during construction.
 
     submit_store / submit_load are non-blocking: they enqueue tasks and return.
     get_finished() polls job completion and returns completed JobResults.
 
-    Eviction:
-        LRU via OrderedDict. Blocks in-flight are never evicted.
     """
 
     def __init__(
         self,
         base_path: str,
-        max_blocks: int,
         tier_name: str = "StorageNixl",
-        n_read_agents: int = 4,
-        n_write_agents: int = 4,
-        tmp_dir: str | None = None,
+        n_read_agents: int = 16,
+        n_write_agents: int = 16,
     ):
         """
         Args:
             base_path: Root directory for block files.
-            max_blocks: Maximum number of blocks to keep indexed (LRU eviction).
             tier_name: Identifier string returned by get_tier_name().
             n_read_agents: Number of read-priority threads (each with its own
                 NIXL agent).
             n_write_agents: Number of write-priority threads (each with its own
                 NIXL agent).
-            tmp_dir: Directory for atomic-write temp files. Defaults to
-                base_path. Must be on the same filesystem as base_path for
-                os.replace() to be atomic.
+
         """
         self._base_path = base_path
-        self._max_blocks = max_blocks
         self._tier_name = tier_name
         self._n_read_agents = n_read_agents
         self._n_write_agents = n_write_agents
-        self._tmp_dir = tmp_dir or base_path
 
-        # Pool is created lazily on first store/load call.
-        self._pool: _NixlDualQueuePool | None = None
-
-        # LRU ordered set: block_hash -> True
-        self._blocks: OrderedDict[OffloadKey, bool] = OrderedDict()
-
-        # block_hash -> job_id (prevents eviction mid-transfer)
-        self._in_flight: dict[OffloadKey, JobId] = {}
+        # Create pool eagerly with NIXL agents
+        self._pool = _NixlDualQueuePool(
+            n_read_agents,
+            n_write_agents,
+            self._make_nixl_agent,
+            thread_name_prefix="vllm_kv_nixl_fs",
+        )
 
         # job_id -> _ActiveJob for all submitted (in-flight) jobs
         self._active_jobs: dict[JobId, _ActiveJob] = {}
 
-        # Number of blocks in _blocks that are NOT currently in _in_flight.
-        self._evictable_count: int = 0
-
         # Long-lived memoryview of the primary CPU tensor (set once by TieringOffloadingManager).
         self._primary_view: memoryview | None = None
-
-    # ------------------------------------------------------------------
-    # Pool / agent management
-    # ------------------------------------------------------------------
 
     def _make_nixl_agent(self, index: int):
         """Create one NIXL agent. Called once per thread at pool startup."""
@@ -446,53 +457,30 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
             instantiate_all=False,
         )
 
-    def _get_pool(self) -> _NixlDualQueuePool:
-        """Lazily create the dual-queue NIXL thread pool."""
-        if self._pool is None:
-            self._pool = _NixlDualQueuePool(
-                self._n_read_agents,
-                self._n_write_agents,
-                self._make_nixl_agent,
-                thread_name_prefix="vllm_kv_nixl_fs",
-            )
-        return self._pool
-
-    # ------------------------------------------------------------------
-    # File-naming (identical to C++ tier)
-    # ------------------------------------------------------------------
-
-    def get_file_name(self, block_hash: int | bytes) -> str:
+    def get_file_name(self, key: OffloadKey) -> str:
         """
         Return the file path for a KV block.
         <base>/<hhh>/<hh>/<hash>.bin — hash-based subdirectories to limit
         directory fan-out.
         """
-        if isinstance(block_hash, bytes):
-            block_hash = int.from_bytes(block_hash, "big")
-        if not isinstance(block_hash, int):
-            raise TypeError(
-                f"block_hash must be int or bytes, got {type(block_hash).__name__}"
-            )
-        block_hash_hex = f"{block_hash & ((1 << 64) - 1):016x}"
+        block_hash = get_offload_block_hash(key)
+        block_hash_hex = block_hash[:8].hex()
         subfolder1, subfolder2 = block_hash_hex[:3], block_hash_hex[3:5]
         return f"{self._base_path}/{subfolder1}/{subfolder2}/{block_hash_hex}.bin"
-
-    def _tmp_path(self, dest_path: str, job_id: JobId) -> str:
-        """Return a temp path for atomic writes."""
-        return f"{dest_path}.{job_id}.tmp"
-
-    # ------------------------------------------------------------------
-    # SecondaryTierManager interface
-    # ------------------------------------------------------------------
 
     def set_primary_view(self, view: memoryview) -> None:
         self._primary_view = view
         self._block_size = view.strides[0]
+        
+        # Register the DRAM buffer with all agents once
+        view_1d = view.cast("B")
+        view_addr = _memview_addr(view_1d)
+        view_size = len(view_1d)
+        self._pool.register_dram_buffer(view_addr, view_size)
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
-        if key in self._in_flight:
-            return None
-        return key in self._blocks
+    def lookup(self, key: OffloadKey, req_context: ReqContext | None = None) -> bool | None:
+        file_path = self.get_file_name(key)
+        return os.path.exists(file_path)
 
     def submit_store(self, job_metadata: JobMetadata) -> bool:
         """
@@ -506,95 +494,26 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_store()"
         )
-        spec: CPULoadStoreSpec = job_metadata.spec
-        job_id = job_metadata.job_id
-        all_keys = job_metadata.keys
-
-        # Keep only blocks not yet on disk and not currently being stored.
-        pairs = [
-            (key, int(bid))
-            for key, bid in zip(all_keys, spec.block_ids)
-            if key not in self._blocks and key not in self._in_flight
-        ]
-        if not pairs:
-            return False
-
-        keys_to_store, block_ids_to_store = map(list, zip(*pairs))
-
-        # LRU eviction: free space for the incoming blocks.
-        num_to_evict = len(keys_to_store) - (
-            self._max_blocks - len(self._blocks)
-        )
-        if num_to_evict > 0:
-            if self._evictable_count < num_to_evict:
-                logger.warning(
-                    "FileSystemTierManagerNixl(%s): insufficient evictable "
-                    "blocks (%d evictable, %d needed); dropping store job %s.",
-                    self._tier_name,
-                    self._evictable_count,
-                    num_to_evict,
-                    job_id,
-                )
-                return False
-
-            protected = set(all_keys)
-            evicted = []
-            for key in self._blocks:  # oldest-first (OrderedDict)
-                if key not in protected and key not in self._in_flight:
-                    evicted.append(key)
-                    if len(evicted) == num_to_evict:
-                        break
-            else:
-                logger.warning(
-                    "FileSystemTierManagerNixl(%s): could not find %d "
-                    "evictable blocks (protected overlap reduced candidates); "
-                    "dropping store job %s.",
-                    self._tier_name,
-                    num_to_evict,
-                    job_id,
-                )
-                return False
-            for key in evicted:
-                file_path = self.get_file_name(get_offload_block_hash(key))
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
-                del self._blocks[key]
-                self._evictable_count -= 1
 
         # Cast to 1D byte view and obtain the base memory address.
         # The cast shares the same memory as self._primary_view (no copy).
-        buffer = self._primary_view.cast("B")
-        buffer_addr = _memview_addr(buffer)
-        state = _JobState(len(keys_to_store))
+        view = self._primary_view.cast("B")
+        view_addr = _memview_addr(view)
+        state = _JobState(len(job_metadata.keys))
 
-        pool = self._get_pool()
-        for key, bid in zip(keys_to_store, block_ids_to_store):
-            dest_path = self.get_file_name(get_offload_block_hash(key))
-            tmp_path = self._tmp_path(dest_path, job_id)
+        for key, bid in zip(job_metadata.keys, job_metadata.spec.block_ids):
+            dest_path = self.get_file_name(key)
+            # Create closure that captures parameters and calls _run_nixl_store
+            def _make_task(bs=self._block_size, va=view_addr, bi=bid,
+                          dp=dest_path, st=state):
+                return lambda agent, dram_handle: _run_nixl_store(agent, dram_handle, bs, va, bi, dp, st)
+            
+            self._pool.enqueue_write(_make_task())
 
-            def _make_task(
-                bs=self._block_size, ba=buffer_addr, bi=bid,
-                dp=dest_path, tp=tmp_path, st=state,
-            ):
-                def task(agent):
-                    try:
-                        _nixl_write_block(agent, bs, ba, bi, dp, tp)
-                        st.task_done(True)
-                    except Exception as exc:
-                        st.task_done(False, exc)
-                return task
-
-            pool.enqueue_write(_make_task())
-
-        for key in keys_to_store:
-            self._in_flight[key] = job_id
-
-        self._active_jobs[job_id] = _ActiveJob(
+        self._active_jobs[job_metadata.job_id] = _ActiveJob(
             is_store=True,
-            keys=keys_to_store,
-            buffer=buffer,
+            keys=job_metadata.keys,
+            view=view,
             state=state,
         )
         return True
@@ -609,50 +528,24 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_load()"
         )
-        spec: CPULoadStoreSpec = job_metadata.spec
-        job_id = job_metadata.job_id
-        keys = list(job_metadata.keys)
-        block_ids = [int(bid) for bid in spec.block_ids]
-
-        for key in keys:
-            if key not in self._blocks:
-                logger.warning(
-                    "FileSystemTierManagerNixl(%s): block %s not found on "
-                    "disk; dropping load job %s.",
-                    self._tier_name,
-                    key,
-                    job_id,
-                )
-                return
         
-        buffer = self._primary_view.cast("B")
-        buffer_addr = _memview_addr(buffer)
-        state = _JobState(len(keys))
+        view = self._primary_view.cast("B")
+        view_addr = _memview_addr(view)
+        state = _JobState(len(job_metadata.keys))
 
-        pool = self._get_pool()
-        for key, bid in zip(keys, block_ids):
-            source_path = self.get_file_name(get_offload_block_hash(key))
+        for key, bid in zip(job_metadata.keys, job_metadata.spec.block_ids):
+            source_path = self.get_file_name(key)
+            # Create closure that captures parameters and calls _run_nixl_load
+            def _make_task(bs=self._block_size, va=view_addr, bi=bid,
+                          sp=source_path, st=state):
+                return lambda agent, dram_handle: _run_nixl_load(agent, dram_handle, bs, va, bi, sp, st)
+            
+            self._pool.enqueue_read(_make_task())
 
-            def _make_task(bs=self._block_size, ba=buffer_addr, bi=bid,
-                           sp=source_path, st=state):
-                def task(agent):
-                    try:
-                        _nixl_read_block(agent, bs, ba, bi, sp)
-                        st.task_done(True)
-                    except Exception as exc:
-                        st.task_done(False, exc)
-                return task
-
-            pool.enqueue_read(_make_task())
-
-        for key in keys:
-            self._in_flight[key] = job_id
-            self._evictable_count -= 1
-
-        self._active_jobs[job_id] = _ActiveJob(
+        self._active_jobs[job_metadata.job_id] = _ActiveJob(
             is_store=False,
-            keys=keys,
-            buffer=buffer,
+            keys=job_metadata.keys,
+            view=view,
             state=state,
         )
 
@@ -677,37 +570,13 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
                 )
 
             # Release memoryview now that all I/O is done.
-            job.buffer.release()
+            job.view.release()
             del self._active_jobs[job_id]
-
-            for key in job.keys:
-                del self._in_flight[key]
-                if job.is_store and success:
-                    self._blocks[key] = True
-                    self._evictable_count += 1
-                elif not job.is_store:
-                    # Load complete (success or failure): block stays in
-                    # _blocks and is no longer in-flight → evictable again.
-                    self._evictable_count += 1
 
             results.append(JobResult(job_id=job_id, success=success))
 
         return results
 
-    def touch(self, keys: Iterable[OffloadKey]) -> None:
-        for key in reversed(list(keys)):
-            if key in self._blocks:
-                self._blocks.move_to_end(key)
 
     def get_tier_name(self) -> str:
         return self._tier_name
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    def get_num_blocks(self) -> int:
-        return len(self._blocks)
-
-    def get_num_in_flight(self) -> int:
-        return len(self._in_flight)

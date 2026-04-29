@@ -151,8 +151,8 @@ class DualQueueThreadPool {
 
 static std::mutex g_pool_mu;
 static std::unique_ptr<DualQueueThreadPool> g_pool;
-static size_t g_n_read  = 0;  // 0 = use default
-static size_t g_n_write = 0;
+static size_t g_n_read  = 16;  
+static size_t g_n_write = 16;
 
 static std::pair<size_t, size_t> default_thread_counts() {
   return {32, 16};
@@ -222,12 +222,14 @@ static bool write_block(const uint8_t* src,
     }
   }
 
-  // Each thread uses a unique random suffix so concurrent workers never
-  // collide on the same temporary filename.
-  thread_local std::string tmp_suffix =
-      "_" + std::to_string(std::random_device{}()) + ".tmp";
-
-  const std::string tmp_path = dest_path + tmp_suffix;
+  // Generate temp path by replacing .bin with .tmp
+  std::string tmp_path = dest_path;
+  size_t bin_pos = tmp_path.rfind(".bin");
+  if (bin_pos != std::string::npos) {
+    tmp_path.replace(bin_pos, 4, ".tmp");
+  } else {
+    tmp_path += ".tmp";
+  }
   int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
   if (fd < 0)
     return fail_write(-1, tmp_path, "open", errno);
@@ -305,13 +307,6 @@ void submit_store_job(int64_t job_id,
                       int64_t block_size,
                       std::vector<int64_t> block_indices,
                       std::vector<std::string> dest_files) {
-  if (block_indices.size() != dest_files.size())
-    throw std::invalid_argument(
-        "block_indices and dest_files must have the same length");
-
-  size_t n = block_indices.size();
-  if (n == 0)
-    throw std::invalid_argument("submit_store_job: no blocks to write");
 
   // Acquire buffer pointer and validate bounds while holding the GIL.
   auto info = buf.request(/*writable=*/false);
@@ -352,7 +347,7 @@ void submit_store_job(int64_t job_id,
 //
 // Args:
 //   job_id        : unique identifier returned by get_finished_jobs().
-//   buffer_list   : writable buffer-protocol objects to read into.
+//   buffer        : writable buffer-protocol objects to read into.
 //                   The caller must keep them alive until the job is done.
 //   block_size    : bytes per block.
 //   block_indices : index of each block within the buffers.
@@ -362,13 +357,6 @@ void submit_load_job(int64_t job_id,
                      int64_t block_size,
                      std::vector<int64_t> block_indices,
                      std::vector<std::string> source_files) {
-  if (block_indices.size() != source_files.size())
-    throw std::invalid_argument(
-        "block_indices and source_files must have the same length");
-
-  size_t n = block_indices.size();
-  if (n == 0)
-    throw std::invalid_argument("submit_load_job: no blocks to read");
 
   // Acquire buffer pointer and validate bounds while holding the GIL.
   auto info = buf.request(/*writable=*/true);
@@ -424,12 +412,7 @@ py::list get_finished_jobs() {
 }
 
 // Set the number of I/O worker threads by replacing the global pool.
-//
-// WARNING: must only be called before any submit_store_job / submit_load_job
-// calls are in flight.  Replacing the pool while tasks from the old pool are
-// outstanding will join (and block on) all outstanding workers in the
-// destructor, and any JobState shared_ptrs held by those workers will keep
-// the state alive until all tasks finish.  Safe usage: call once at startup.
+
 void set_thread_count(size_t n_read, size_t n_write) {
   if (n_read == 0 && n_write == 0)
     throw std::invalid_argument(
@@ -438,103 +421,6 @@ void set_thread_count(size_t n_read, size_t n_write) {
   g_n_read  = n_read;
   g_n_write = n_write;
   g_pool = std::make_unique<DualQueueThreadPool>(n_read, n_write);
-}
-
-// Bulk variants: enqueue exactly ONE task per job that processes all blocks
-// sequentially inside the task.  This eliminates N-1 queue lock acquisitions
-// and N-1 thread wake-ups per job at the cost of within-job parallelism.
-//
-// Best for workloads with many small jobs (few blocks each), where the queue
-// overhead dominates over per-block I/O time.
-void submit_store_job_bulk(int64_t job_id,
-                           py::buffer buf,
-                           int64_t block_size,
-                           std::vector<int64_t> block_indices,
-                           std::vector<std::string> dest_files) {
-  if (block_indices.size() != dest_files.size())
-    throw std::invalid_argument(
-        "block_indices and dest_files must have the same length");
-
-  size_t n = block_indices.size();
-  if (n == 0)
-    throw std::invalid_argument("submit_store_job_bulk: no blocks to write");
-
-  auto info = buf.request(/*writable=*/false);
-  const uint8_t* src_ptr = static_cast<const uint8_t*>(info.ptr);
-  const int64_t buf_bytes = static_cast<int64_t>(info.size) *
-                            static_cast<int64_t>(info.itemsize);
-
-  for (size_t i = 0; i < n; ++i) {
-    const int64_t start = block_indices[i] * block_size;
-    const int64_t end   = start + block_size;
-    if (start < 0 || end > buf_bytes)
-      throw std::out_of_range(
-          "submit_store_job_bulk: block_indices[" + std::to_string(i) +
-          "] out of buffer range");
-  }
-
-  // Single task with total_tasks=1: the task processes all N blocks serially.
-  auto state = std::make_shared<JobState>(1);
-  {
-    std::lock_guard<std::mutex> lk(g_jobs_mu);
-    g_jobs[job_id] = state;
-  }
-
-  auto& p = pool();
-  p.enqueue_write([src_ptr, block_size, block_indices = std::move(block_indices),
-                   dest_files = std::move(dest_files), state]() {
-    bool all_ok = true;
-    for (size_t i = 0; i < block_indices.size(); ++i) {
-      bool ok = write_block(src_ptr, block_indices[i], block_size, dest_files[i]);
-      if (!ok) all_ok = false;
-    }
-    state->task_done(all_ok);
-  });
-}
-
-void submit_load_job_bulk(int64_t job_id,
-                          py::buffer buf,
-                          int64_t block_size,
-                          std::vector<int64_t> block_indices,
-                          std::vector<std::string> source_files) {
-  if (block_indices.size() != source_files.size())
-    throw std::invalid_argument(
-        "block_indices and source_files must have the same length");
-
-  size_t n = block_indices.size();
-  if (n == 0)
-    throw std::invalid_argument("submit_load_job_bulk: no blocks to read");
-
-  auto info = buf.request(/*writable=*/true);
-  uint8_t* dst_ptr = static_cast<uint8_t*>(info.ptr);
-  const int64_t buf_bytes = static_cast<int64_t>(info.size) *
-                            static_cast<int64_t>(info.itemsize);
-
-  for (size_t i = 0; i < n; ++i) {
-    const int64_t start = block_indices[i] * block_size;
-    const int64_t end   = start + block_size;
-    if (start < 0 || end > buf_bytes)
-      throw std::out_of_range(
-          "submit_load_job_bulk: block_indices[" + std::to_string(i) +
-          "] out of buffer range");
-  }
-
-  auto state = std::make_shared<JobState>(1);
-  {
-    std::lock_guard<std::mutex> lk(g_jobs_mu);
-    g_jobs[job_id] = state;
-  }
-
-  auto& p = pool();
-  p.enqueue_read([dst_ptr, block_size, block_indices = std::move(block_indices),
-                  source_files = std::move(source_files), state]() {
-    bool all_ok = true;
-    for (size_t i = 0; i < block_indices.size(); ++i) {
-      bool ok = read_block(dst_ptr, block_indices[i], block_size, source_files[i]);
-      if (!ok) all_ok = false;
-    }
-    state->task_done(all_ok);
-  });
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -550,20 +436,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("submit_load_job", &submit_load_job,
         "Enqueue read tasks for a KV load job (one task per block file).\n"
         "Non-blocking. Call get_finished_jobs() to poll for completion.\n"
-        "The caller must keep buf alive until the job is reported done.",
-        py::arg("job_id"), py::arg("buf"), py::arg("block_size"),
-        py::arg("block_indices"), py::arg("source_files"));
-
-  m.def("submit_store_job_bulk", &submit_store_job_bulk,
-        "Enqueue a single bulk write task for a KV store job (all blocks in one task).\n"
-        "Non-blocking. Lower queue overhead than submit_store_job; no within-job parallelism.\n"
-        "The caller must keep buf alive until the job is reported done.",
-        py::arg("job_id"), py::arg("buf"), py::arg("block_size"),
-        py::arg("block_indices"), py::arg("dest_files"));
-
-  m.def("submit_load_job_bulk", &submit_load_job_bulk,
-        "Enqueue a single bulk read task for a KV load job (all blocks in one task).\n"
-        "Non-blocking. Lower queue overhead than submit_load_job; no within-job parallelism.\n"
         "The caller must keep buf alive until the job is reported done.",
         py::arg("job_id"), py::arg("buf"), py::arg("block_size"),
         py::arg("block_indices"), py::arg("source_files"));
