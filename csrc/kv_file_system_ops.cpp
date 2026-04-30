@@ -314,6 +314,7 @@ void submit_store_job(int64_t job_id,
   const int64_t buf_bytes = static_cast<int64_t>(info.size) *
                             static_cast<int64_t>(info.itemsize);
 
+  const size_t n = block_indices.size();
   for (size_t i = 0; i < n; ++i) {
     const int64_t start = block_indices[i] * block_size;
     const int64_t end   = start + block_size;
@@ -364,6 +365,7 @@ void submit_load_job(int64_t job_id,
   const int64_t buf_bytes = static_cast<int64_t>(info.size) *
                             static_cast<int64_t>(info.itemsize);
 
+  const size_t n = block_indices.size();
   for (size_t i = 0; i < n; ++i) {
     const int64_t start = block_indices[i] * block_size;
     const int64_t end   = start + block_size;
