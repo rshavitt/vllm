@@ -17,19 +17,15 @@ I/O is performed by the _kv_file_system_ops C++ extension (pread/pwrite,
 internal dual-queue thread pool). One C++ task is enqueued per block file,
 tracked by a shared JobState. get_finished_jobs() polls which jobs are done.
 
-Memory safety: _ActiveJob.buffers holds memoryviews of the CPU tensors,
-keeping them alive until the C++ tasks finish. Views are released once
-get_finished_jobs() reports the job as done.
 """
 
 import os
-from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Sequence
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.abstract import (
+from vllm.v1.kv_offload.base import (
     OffloadKey,
     ReqContext,
     get_offload_block_hash,
@@ -40,7 +36,6 @@ from vllm.v1.kv_offload.tiering.base import (
     JobResult,
     SecondaryTierManager,
 )
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 
 logger = init_logger(__name__)
 
@@ -63,13 +58,6 @@ except ImportError as e:
     ) from e
 
 
-@dataclass
-class _ActiveJob:
-    """A job whose tasks have been enqueued in the C++ pool."""
-    is_store: bool
-    keys:     list[OffloadKey]
-
-
 class FileSystemTierManagerCpp(SecondaryTierManager):
     """
     Disk-backed secondary tier that stores each KV block as a single file.
@@ -82,8 +70,6 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
     TieredOffloadingManager calls primary.finalize_blocks() after
     get_finished() reports a load as successful.
 
-    Eviction:
-        LRU via OrderedDict. Blocks in-flight are never evicted.
     """
 
     def __init__(
@@ -108,7 +94,7 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
         cpp_set_thread_count(n_read_threads, n_write_threads)
 
         # job_id -> _ActiveJob for all submitted (in-flight) jobs
-        self._active_jobs: dict[JobId, _ActiveJob] = {}
+        self._active_jobs: dict[JobId, bool] = {}
 
         # Long-lived memoryview of the primary CPU tensor (set once by TieringOffloadingManager).
         self._primary_view: memoryview | None = None
@@ -139,62 +125,35 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
 
         Returns True if an async job was submitted, False if dropped.
         """
-        assert isinstance(job_metadata.spec, CPULoadStoreSpec), (
-            f"Expected CPULoadStoreSpec, got {type(job_metadata.spec)}"
-        )
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_store()"
         )
         dest_files = [self.get_file_name(key) for key in job_metadata.keys]
 
         cpp_submit_store_job(job_metadata.job_id, self._primary_view, self._block_size,
-                       job_metadata.spec.block_ids, dest_files)
+                       job_metadata.block_ids, dest_files)
 
-        self._active_jobs[job_metadata.job_id] = _ActiveJob(
-            is_store=True,
-            keys=job_metadata.keys
-        )
+        self._active_jobs[job_metadata.job_id] = True
         return True
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         """
         Submit a load job to the C++ thread pool immediately.
         """
-        assert isinstance(job_metadata.spec, CPULoadStoreSpec), (
-            f"Expected CPULoadStoreSpec, got {type(job_metadata.spec)}"
-        )
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_load()"
         )
 
         source_files = [self.get_file_name(key) for key in job_metadata.keys]
-
-        cpp_submit_load_job(job_metadata.job_id, self._primary_view, self._block_size, job_metadata.spec.block_ids, source_files)
-
-        self._active_jobs[job_metadata.job_id] = _ActiveJob(
-            is_store=False,
-            keys=job_metadata.keys
-        )
+        cpp_submit_load_job(job_metadata.job_id, self._primary_view, self._block_size, job_metadata.block_ids, source_files)        
 
     def get_finished(self) -> Iterable[JobResult]:
         """
-        Collect completed jobs reported by the C++ pool.
+        Collect completed jobs reported by the C++ extention.
 
-        The C++ extension returns job_id values directly. Since the C++ pool
-        is global and shared across all FileSystemTierManagerCpp instances,
-        we simply process all returned jobs that match our active jobs.
         """
-        results: list[JobResult] = []
+        return [JobResult(job_id=jid, success=ok) for jid, ok in cpp_get_finished_jobs()]
 
-        # Get completed jobs from C++ extension
-        for job_id, success in cpp_get_finished_jobs():
-            # Check if this job belongs to this instance
-            if job_id in self._active_jobs:
-                # Remove from active jobs (releases buffer reference)
-                self._active_jobs.pop(job_id)
-                results.append(JobResult(job_id=job_id, success=success))
-
-        return results
-
-    def get_tier_name(self) -> str:
-        return self._tier_name
+    @staticmethod
+    def get_tier_type() -> str:
+        return "file_system_cpp"

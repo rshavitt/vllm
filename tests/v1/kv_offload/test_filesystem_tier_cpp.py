@@ -13,7 +13,7 @@ Note: These tests require the _kv_file_system_ops extension to be built.
 
 import os
 import time
-
+import numpy as np
 import pytest
 import torch
 
@@ -25,9 +25,9 @@ pytest.importorskip(
     reason="_kv_file_system_ops extension not built; these tests require the compiled extension"
 )
 
-from vllm.v1.kv_offload.abstract import OffloadKey, ReqContext, get_offload_block_hash, make_offload_key  # noqa: E402
+from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key  # noqa: E402
 from vllm.v1.kv_offload.tiering.base import JobMetadata
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec  # noqa: E402
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec  # noqa: E402
 from vllm.v1.kv_offload.tiering.file_system_cpp import (  # noqa: E402
     FileSystemTierManagerCpp,
 )
@@ -78,8 +78,7 @@ def make_job(
 ) -> JobMetadata:
     if block_ids is None:
         block_ids = list(range(len(keys)))
-    spec = make_cpu_spec(block_ids)
-    return JobMetadata(job_id=job_id, keys=keys, spec=spec)
+    return JobMetadata(job_id=job_id, keys=keys, block_ids=np.array(block_ids, dtype=np.float16))
 
 
 def drain(tier: FileSystemTierManagerCpp, max_rounds: int = 20) -> list:
@@ -111,10 +110,6 @@ class TestFileSystemTierBasic:
             n_write_threads=4,
         )
         yield
-
-    def test_get_tier_name(self):
-        t = FileSystemTierManagerCpp(base_path="/tmp/test", tier_name="MyTier")
-        assert t.get_tier_name() == "MyTier"
 
     def test_lookup_empty_tier(self):
         assert self.tier.lookup(key(1)) is False

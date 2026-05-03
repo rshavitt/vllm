@@ -30,17 +30,15 @@ import functools
 import os
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.abstract import OffloadKey, ReqContext, get_offload_block_hash
+from vllm.v1.kv_offload.base import OffloadKey, ReqContext, get_offload_block_hash
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobMetadata,
     JobResult,
     SecondaryTierManager,
 )
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 
 logger = init_logger(__name__)
 
@@ -242,19 +240,6 @@ def _load_block(
         state.task_done(False, exc)
 
 # ---------------------------------------------------------------------------
-# _ActiveJob
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _ActiveJob:
-    """A job whose per-block tasks have been enqueued in the thread pool."""
-    is_store: bool
-    keys: list[OffloadKey]
-    buffer: memoryview  # kept alive until state.is_done
-    state: _JobState
-
-
-# ---------------------------------------------------------------------------
 # FileSystemTierManagerPython
 # ---------------------------------------------------------------------------
 
@@ -274,7 +259,6 @@ class FileSystemTierManagerPython(SecondaryTierManager):
     def __init__(
         self,
         base_path: str,
-        tier_name: str = "StoragePython",
         n_read_threads: int = 16,
         n_write_threads: int = 16,
     ):
@@ -286,7 +270,6 @@ class FileSystemTierManagerPython(SecondaryTierManager):
             n_write_threads: Number of write-priority I/O threads.
         """
         self._base_path = base_path
-        self._tier_name = tier_name
 
         self._pool = _DualQueueThreadPool(
             n_read_threads,
@@ -294,8 +277,8 @@ class FileSystemTierManagerPython(SecondaryTierManager):
             thread_name_prefix="vllm_kv_py_fs",
         )
 
-        # job_id -> _ActiveJob for all submitted (in-flight) jobs
-        self._active_jobs: dict[JobId, _ActiveJob] = {}
+        # job_id -> _JobState for all submitted (in-flight) jobs
+        self._active_jobs: dict[JobId, _JobState] = {}
 
         # Long-lived memoryview of the primary CPU tensor (set once by TieringOffloadingManager).
         self._primary_view: memoryview | None = None
@@ -313,8 +296,8 @@ class FileSystemTierManagerPython(SecondaryTierManager):
         return f"{self._base_path}/{subfolder1}/{subfolder2}/{block_hash_hex}.bin"
 
     def set_primary_view(self, view: memoryview) -> None:
-        self._primary_view = view
         self._block_size = view.strides[0]  # type: ignore
+        self._primary_view = view.cast("B")
 
     def lookup(self, key: OffloadKey, req_context: ReqContext | None = None) -> bool | None:
         file_path = self.get_file_name(key)
@@ -326,35 +309,24 @@ class FileSystemTierManagerPython(SecondaryTierManager):
 
         Returns True if an async job was submitted, False if dropped.
         """
-        assert isinstance(job_metadata.spec, CPULoadStoreSpec), (
-            f"Expected CPULoadStoreSpec, got {type(job_metadata.spec)}"
-        )
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_store()"
         )
 
-        # TODO: remove or change tests if decideing to move this check to workers    
+        # TODO: remove or change tests if decideing to move this check to workers
         if all(self.lookup(key) for key in job_metadata.keys):
             return False
 
-        # Cast to 1D byte view so os.write receives a flat buffer.
-        # The cast shares the same memory as self._primary_view (no copy).
-        buffer = self._primary_view.cast("B")
         state = _JobState(len(job_metadata.keys))
 
-        for key, bid in zip(job_metadata.keys, job_metadata.spec.block_ids):
+        for key, bid in zip(job_metadata.keys, job_metadata.block_ids):
             dest_path = self.get_file_name(key)
             offset = bid * self._block_size
             self._pool.enqueue_write(
-                functools.partial(_store_block, dest_path, buffer, offset, self._block_size, state)
+                functools.partial(_store_block, dest_path, self._primary_view, offset, self._block_size, state)
             )
 
-        self._active_jobs[job_metadata.job_id] = _ActiveJob(
-            is_store=True,
-            keys=job_metadata.keys,
-            buffer=buffer,
-            state=state,
-        )
+        self._active_jobs[job_metadata.job_id] = state
         # TODO: remove after changing the method to return None after changing the API.
         return True
 
@@ -362,32 +334,20 @@ class FileSystemTierManagerPython(SecondaryTierManager):
         """
         Submit a load job: enqueue one read task per block to the read queue.
         """
-        assert isinstance(job_metadata.spec, CPULoadStoreSpec), (
-            f"Expected CPULoadStoreSpec, got {type(job_metadata.spec)}"
-        )
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_load()"
         )
-        keys = list(job_metadata.keys)
-        block_ids = [int(bid) for bid in job_metadata.spec.block_ids]
+        block_ids = [int(bid) for bid in job_metadata.block_ids]
+        state = _JobState(len(job_metadata.keys))
 
-        # Cast to 1D byte view so os.readv receives a flat writable buffer.
-        buffer = self._primary_view.cast("B")
-        state = _JobState(len(keys))
-
-        for key, bid in zip(keys, block_ids):
+        for key, bid in zip(job_metadata.keys, block_ids):
             source_path = self.get_file_name(key)
             offset = bid * self._block_size
             self._pool.enqueue_read(
-                functools.partial(_load_block, source_path, buffer, offset, self._block_size, state)
+                functools.partial(_load_block, source_path, self._primary_view, offset, self._block_size, state)
             )
 
-        self._active_jobs[job_metadata.job_id] = _ActiveJob(
-            is_store=False,
-            keys=keys,
-            buffer=buffer,
-            state=state,
-        )
+        self._active_jobs[job_metadata.job_id] = state
 
     def get_finished(self) -> Iterable[JobResult]:
         """
@@ -395,26 +355,25 @@ class FileSystemTierManagerPython(SecondaryTierManager):
         """
         results: list[JobResult] = []
 
-        for job_id, job in list(self._active_jobs.items()):
-            if not job.state.is_done:
+        for job_id, state in list(self._active_jobs.items()):
+            if not state.is_done:
                 continue
 
-            success = job.state.success
-            for err in job.state.errors:
+            success = state.success
+            for err in state.errors:
                 logger.error(
-                    "FileSystemTierManagerPython(%s): job %s block I/O "
+                    "FileSystemTierManagerPython: job %s block I/O "
                     "failed: %s",
-                    self._tier_name,
                     job_id,
                     err,
                 )
 
-            job.buffer.release()
             del self._active_jobs[job_id]
 
             results.append(JobResult(job_id=job_id, success=success))
 
         return results
 
-    def get_tier_name(self) -> str:
-        return self._tier_name
+    @staticmethod
+    def get_tier_type() -> str:
+        return "file_system_python"

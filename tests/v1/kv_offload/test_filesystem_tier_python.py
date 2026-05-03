@@ -11,12 +11,14 @@ data integrity throughout the process.
 import os
 import time
 
+import numpy as np
+
 import pytest
 import torch
 
-from vllm.v1.kv_offload.abstract import OffloadKey, ReqContext, get_offload_block_hash, make_offload_key
+from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import JobMetadata
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.file_system_python import (
     FileSystemTierManagerPython,
 )
@@ -31,11 +33,6 @@ _DTYPE = torch.float32
 
 def key(n: int) -> OffloadKey:
     return make_offload_key(n.to_bytes(8, "big"), 0)
-
-
-def make_cpu_spec(block_ids: list[int]) -> CPULoadStoreSpec:
-    return CPULoadStoreSpec(block_ids)
-
 
 def make_tier_with_view(
     base_path: str,
@@ -54,8 +51,7 @@ def make_job(
 ) -> JobMetadata:
     if block_ids is None:
         block_ids = list(range(len(keys)))
-    spec = make_cpu_spec(block_ids)
-    return JobMetadata(job_id=job_id, keys=keys, spec=spec)
+    return JobMetadata(job_id=job_id, keys=keys, block_ids=np.array(block_ids, dtype=np.int64))
 
 
 def drain(tier: FileSystemTierManagerPython, max_rounds: int = 40) -> list:
@@ -86,11 +82,6 @@ class TestPythonFSTierBasic:
         self.tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
         self.tier.set_primary_view(memoryview(self.tensor.numpy()))
         yield
-
-    def test_get_tier_name(self):
-        assert self.tier.get_tier_name() == "StoragePython"
-        t = FileSystemTierManagerPython(base_path="/tmp/test", tier_name="MyTier")
-        assert t.get_tier_name() == "MyTier"
 
     def test_lookup_empty_tier(self):
         assert self.tier.lookup(key(1)) is False

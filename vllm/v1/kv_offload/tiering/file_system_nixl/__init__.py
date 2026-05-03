@@ -28,19 +28,17 @@ import collections
 import os
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
 
 import ctypes
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.abstract import OffloadKey, ReqContext, get_offload_block_hash
+from vllm.v1.kv_offload.base import OffloadKey, ReqContext, get_offload_block_hash
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobMetadata,
     JobResult,
     SecondaryTierManager,
 )
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 try:
     from nixl._api import nixl_agent, nixl_agent_config
 except ImportError as e:
@@ -219,16 +217,6 @@ class _JobState:
 
 
 # ---------------------------------------------------------------------------
-# Memory address helper
-# ---------------------------------------------------------------------------
-
-def _memview_addr(view: memoryview) -> int:
-    """Return the memory address of a writable memoryview."""
-    view_1d = view.cast("B") if view.ndim > 1 else view
-    return ctypes.addressof(ctypes.c_char.from_buffer(view_1d))
-
-
-# ---------------------------------------------------------------------------
 # Per-block NIXL I/O callbacks — module-level so they are not re-created each loop
 # ---------------------------------------------------------------------------
 
@@ -309,8 +297,6 @@ def _run_nixl_store(
             agent.release_xfer_handle(xfer_handle)
         if file_handle is not None:
             agent.deregister_memory(file_handle)
-        if dram_handle is not None:
-            agent.deregister_memory(dram_handle)
 
 
 def _run_nixl_load(
@@ -378,19 +364,6 @@ def _run_nixl_load(
 
 
 # ---------------------------------------------------------------------------
-# _ActiveJob
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _ActiveJob:
-    """A job whose per-block tasks have been enqueued in the thread pool."""
-    is_store: bool
-    keys: list[OffloadKey]
-    view: memoryview  # kept alive until state.is_done
-    state: _JobState
-
-
-# ---------------------------------------------------------------------------
 # FileSystemTierManagerNixl
 # ---------------------------------------------------------------------------
 
@@ -439,8 +412,8 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
             thread_name_prefix="vllm_kv_nixl_fs",
         )
 
-        # job_id -> _ActiveJob for all submitted (in-flight) jobs
-        self._active_jobs: dict[JobId, _ActiveJob] = {}
+        # job_id -> _JobState for all submitted (in-flight) jobs
+        self._active_jobs: dict[JobId, _JobState] = {}
 
         # Long-lived memoryview of the primary CPU tensor (set once by TieringOffloadingManager).
         self._primary_view: memoryview | None = None
@@ -469,14 +442,13 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
         return f"{self._base_path}/{subfolder1}/{subfolder2}/{block_hash_hex}.bin"
 
     def set_primary_view(self, view: memoryview) -> None:
-        self._primary_view = view
         self._block_size = view.strides[0]
-        
+        self._primary_view = view.cast("B")
+
         # Register the DRAM buffer with all agents once
-        view_1d = view.cast("B")
-        view_addr = _memview_addr(view_1d)
-        view_size = len(view_1d)
-        self._pool.register_dram_buffer(view_addr, view_size)
+        self._view_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._primary_view))
+        view_size = len(self._primary_view)
+        self._pool.register_dram_buffer(self._view_addr, view_size)
 
     def lookup(self, key: OffloadKey, req_context: ReqContext | None = None) -> bool | None:
         file_path = self.get_file_name(key)
@@ -488,66 +460,47 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
 
         Returns True if an async job was submitted, False if dropped.
         """
-        assert isinstance(job_metadata.spec, CPULoadStoreSpec), (
-            f"Expected CPULoadStoreSpec, got {type(job_metadata.spec)}"
-        )
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_store()"
         )
 
-        # Cast to 1D byte view and obtain the base memory address.
-        # The cast shares the same memory as self._primary_view (no copy).
-        view = self._primary_view.cast("B")
-        view_addr = _memview_addr(view)
+        if all(self.lookup(key) for key in job_metadata.keys):
+            return False
+
         state = _JobState(len(job_metadata.keys))
 
-        for key, bid in zip(job_metadata.keys, job_metadata.spec.block_ids):
+        for key, bid in zip(job_metadata.keys, job_metadata.block_ids):
             dest_path = self.get_file_name(key)
             # Create closure that captures parameters and calls _run_nixl_store
-            def _make_task(bs=self._block_size, va=view_addr, bi=bid,
+            def _make_task(bs=self._block_size, va=self._view_addr, bi=bid,
                           dp=dest_path, st=state):
                 return lambda agent, dram_handle: _run_nixl_store(agent, dram_handle, bs, va, bi, dp, st)
             
             self._pool.enqueue_write(_make_task())
 
-        self._active_jobs[job_metadata.job_id] = _ActiveJob(
-            is_store=True,
-            keys=job_metadata.keys,
-            view=view,
-            state=state,
-        )
+        self._active_jobs[job_metadata.job_id] = state
         return True
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         """
         Submit a load job: enqueue one read task per block to the read queue.
         """
-        assert isinstance(job_metadata.spec, CPULoadStoreSpec), (
-            f"Expected CPULoadStoreSpec, got {type(job_metadata.spec)}"
-        )
         assert self._primary_view is not None, (
             "set_primary_view() must be called before submit_load()"
         )
-        
-        view = self._primary_view.cast("B")
-        view_addr = _memview_addr(view)
+
         state = _JobState(len(job_metadata.keys))
 
-        for key, bid in zip(job_metadata.keys, job_metadata.spec.block_ids):
+        for key, bid in zip(job_metadata.keys, job_metadata.block_ids):
             source_path = self.get_file_name(key)
             # Create closure that captures parameters and calls _run_nixl_load
-            def _make_task(bs=self._block_size, va=view_addr, bi=bid,
+            def _make_task(bs=self._block_size, va=self._view_addr, bi=bid,
                           sp=source_path, st=state):
                 return lambda agent, dram_handle: _run_nixl_load(agent, dram_handle, bs, va, bi, sp, st)
             
             self._pool.enqueue_read(_make_task())
 
-        self._active_jobs[job_metadata.job_id] = _ActiveJob(
-            is_store=False,
-            keys=job_metadata.keys,
-            view=view,
-            state=state,
-        )
+        self._active_jobs[job_metadata.job_id] = state
 
     def get_finished(self) -> Iterable[JobResult]:
         """
@@ -555,12 +508,12 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
         """
         results: list[JobResult] = []
 
-        for job_id, job in list(self._active_jobs.items()):
-            if not job.state.is_done:
+        for job_id, state in list(self._active_jobs.items()):
+            if not state.is_done:
                 continue
 
-            success = job.state.success
-            for err in job.state.errors:
+            success = state.success
+            for err in state.errors:
                 logger.error(
                     "FileSystemTierManagerNixl(%s): job %s NIXL I/O "
                     "failed: %s",
@@ -569,8 +522,6 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
                     err,
                 )
 
-            # Release memoryview now that all I/O is done.
-            job.view.release()
             del self._active_jobs[job_id]
 
             results.append(JobResult(job_id=job_id, success=success))
@@ -578,5 +529,6 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
         return results
 
 
-    def get_tier_name(self) -> str:
-        return self._tier_name
+    @staticmethod
+    def get_tier_type() -> str:
+        return "file_system_nixl"
