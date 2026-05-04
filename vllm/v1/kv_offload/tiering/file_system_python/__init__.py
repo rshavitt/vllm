@@ -265,7 +265,6 @@ class FileSystemTierManagerPython(SecondaryTierManager):
         """
         Args:
             base_path: Root directory for block files.
-            tier_name: Identifier string returned by get_tier_name().
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
         """

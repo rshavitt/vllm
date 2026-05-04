@@ -385,14 +385,12 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
     def __init__(
         self,
         base_path: str,
-        tier_name: str = "StorageNixl",
         n_read_agents: int = 16,
         n_write_agents: int = 16,
     ):
         """
         Args:
             base_path: Root directory for block files.
-            tier_name: Identifier string returned by get_tier_name().
             n_read_agents: Number of read-priority threads (each with its own
                 NIXL agent).
             n_write_agents: Number of write-priority threads (each with its own
@@ -400,7 +398,6 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
 
         """
         self._base_path = base_path
-        self._tier_name = tier_name
         self._n_read_agents = n_read_agents
         self._n_write_agents = n_write_agents
 
@@ -425,7 +422,7 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
             backends=["POSIX"],
         )
         return nixl_agent(
-            agent_name=f"vllm_kv_nixl_{self._tier_name}_{index}",
+            agent_name=f"vllm_kv_nixl_{index}",
             nixl_conf=conf,
             instantiate_all=False,
         )
@@ -515,9 +512,8 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
             success = state.success
             for err in state.errors:
                 logger.error(
-                    "FileSystemTierManagerNixl(%s): job %s NIXL I/O "
+                    "FileSystemTierManagerNixl: job %s NIXL I/O "
                     "failed: %s",
-                    self._tier_name,
                     job_id,
                     err,
                 )

@@ -75,21 +75,18 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
     def __init__(
         self,
         base_path: str,
-        tier_name: str = "StorageCpp",
         n_read_threads: int | None = 16,
         n_write_threads: int | None = 16,
     ):
         """
         Args:
             base_path: Root directory for block files.
-            tier_name: Identifier string returned by get_tier_name().
             n_read_threads: Number of read-priority I/O threads. If provided
                 together with n_write_threads, overrides the default (32/16).
             n_write_threads: Number of write-priority I/O threads. Must be
                 provided together with n_read_threads.
         """
         self._base_path = base_path
-        self._tier_name = tier_name
 
         cpp_set_thread_count(n_read_threads, n_write_threads)
 
