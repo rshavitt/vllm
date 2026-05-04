@@ -414,6 +414,7 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
 
         # Long-lived memoryview of the primary CPU tensor (set once by TieringOffloadingManager).
         self._primary_view: memoryview | None = None
+        self._block_size: int = 0
 
     def _make_nixl_agent(self, index: int):
         """Create one NIXL agent. Called once per thread at pool startup."""
@@ -439,6 +440,7 @@ class FileSystemTierManagerNixl(SecondaryTierManager):
         return f"{self._base_path}/{subfolder1}/{subfolder2}/{block_hash_hex}.bin"
 
     def set_primary_view(self, view: memoryview) -> None:
+        assert view.strides is not None, "view.strides cannot be None"
         self._block_size = view.strides[0]
         self._primary_view = view.cast("B")
 

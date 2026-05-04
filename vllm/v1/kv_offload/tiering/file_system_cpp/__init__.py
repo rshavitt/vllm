@@ -108,8 +108,9 @@ class FileSystemTierManagerCpp(SecondaryTierManager):
         return f"{self._base_path}/{subfolder1}/{subfolder2}/{block_hash_hex}.bin"
 
     def set_primary_view(self, view: memoryview) -> None:
-        self._primary_view = view
+        assert view.strides is not None, "view.strides cannot be None"
         self._block_size = view.strides[0]
+        self._primary_view = view
 
     def lookup(self, key: OffloadKey, req_context: ReqContext | None = None) -> bool | None:
         file_path = self.get_file_name(key)
