@@ -6,12 +6,12 @@ Factory for creating secondary tier implementations.
 
 from vllm.v1.kv_offload.tiering.base import SecondaryTierManager
 from vllm.v1.kv_offload.tiering.example import ExampleSecondaryTier
-from vllm.v1.kv_offload.tiering.file_system_python import \
-    FileSystemTierManagerPython
+from vllm.v1.kv_offload.tiering.fs.manager import \
+    FileSystemTierManager
 
 SUPPORTED_TIERS: tuple[type[SecondaryTierManager], ...] = (
     ExampleSecondaryTier,
-    FileSystemTierManagerPython,
+    FileSystemTierManager,
     )
 
 _TIER_REGISTRY: dict[str, type[SecondaryTierManager]] = {

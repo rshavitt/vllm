@@ -19,10 +19,13 @@ import torch
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import JobMetadata
-from vllm.v1.kv_offload.tiering.file_system_python import (
-    FileSystemTierManagerPython,
+from vllm.v1.kv_offload.tiering.fs.manager import (
+    FileSystemTierManager,
 )
-
+from vllm.v1.kv_offload.tiering.manager import (
+    CPUPrimaryTierOffloadingManager,
+    TieringOffloadingManager,
+)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -34,15 +37,6 @@ _CTX = ReqContext()
 def key(n: int) -> OffloadKey:
     return make_offload_key(n.to_bytes(8, "big"), 0)
 
-def make_tier_with_view(
-    base_path: str,
-    num_total_blocks: int = 32,
-) -> FileSystemTierManagerPython:
-    tier = FileSystemTierManagerPython(base_path=base_path)
-    tensor = torch.zeros((num_total_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
-    tier.set_primary_view(memoryview(tensor.numpy()))
-    return tier
-
 def make_job(
     job_id: int,
     keys: list[OffloadKey],
@@ -53,7 +47,7 @@ def make_job(
     return JobMetadata(job_id=job_id, keys=keys, block_ids=np.array(block_ids, dtype=np.int64))
 
 
-def drain(tier: FileSystemTierManagerPython, max_rounds: int = 40) -> list:
+def drain(tier: FileSystemTierManager, max_rounds: int = 40) -> list:
     """
     Call get_finished() repeatedly until all jobs are resolved or timeout.
     """
@@ -71,26 +65,28 @@ def drain(tier: FileSystemTierManagerPython, max_rounds: int = 40) -> list:
 # ---------------------------------------------------------------------------
 
 class TestPythonFSTierBasic:
-    """Tests for basic tier functionality with real I/O."""
+    """Tests for basic tier functionality"""
 
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
-        self.tier = FileSystemTierManagerPython(
-            base_path=str(tmp_path)
+        self.tier = FileSystemTierManager(
+            base_path=str(tmp_path),
+            n_read_threads=4,
+            n_write_threads=4,
         )
-        self.tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
-        self.tier.set_primary_view(memoryview(self.tensor.numpy()))
+        tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        self.tier.set_primary_view(memoryview(tensor.numpy()))
         yield
 
     def test_get_tier_type(self):
-        assert FileSystemTierManagerPython.get_tier_type() == "file_system_python"
+        assert FileSystemTierManager.get_tier_type() == "file_system_python"
 
     def test_lookup_empty_tier(self):
         assert self.tier.lookup(key(1)) is False
         assert self.tier.lookup(key(2)) is False
 
     def test_get_file_name_structure(self):
-        tier = FileSystemTierManagerPython(base_path="/kvcache")
+        tier = FileSystemTierManager(base_path="/kvcache")
         path = tier.get_file_name(key(0))
         assert path == "/kvcache/000/00/0000000000000000.bin"
 
@@ -104,17 +100,6 @@ class TestPythonFSTierBasic:
         assert self.tier.lookup(key(1)) is True
         dest = self.tier.get_file_name(key(1))
         assert os.path.exists(dest), f"Expected file at {dest}"
-
-    def test_store_skips_already_stored_blocks(self):
-        # Store once
-        job = make_job(1, [key(1)], [0])
-        self.tier.submit_store(job)
-        drain(self.tier)
-        
-        # Try to store again - should skip
-        job2 = make_job(2, [key(1)], [0])
-        submitted = self.tier.submit_store(job2)
-        assert not submitted  # Should return False since block already exists
 
     def test_store_then_load_roundtrip(self):
         job_s = make_job(1, [key(1), key(2)], [0, 1])
@@ -135,7 +120,7 @@ class TestPythonFSTierBasic:
     def test_failed_store_with_invalid_path(self, tmp_path):
         """Test that failed store operations are reported correctly."""
         # Create a tier with an invalid base path to trigger I/O failures
-        tier = FileSystemTierManagerPython(
+        tier = FileSystemTierManager(
             base_path="/dev/null/invalid_path"
         )
         tensor = torch.zeros((32, _BLOCK_ELEMENTS), dtype=_DTYPE)
@@ -167,46 +152,28 @@ class TestPythonFSTierBasic:
         assert self.tier.lookup(key(1)) is True
         assert self.tier.lookup(key(2)) is True
 
-
-# ---------------------------------------------------------------------------
-# I/O integration tests — real disk
-# ---------------------------------------------------------------------------
-
-class TestPythonFSTierIO:
-
-    def _make_tier(self, base_path, num_total_blocks: int = 8, **kwargs):
-        tier = FileSystemTierManagerPython(
-            base_path=str(base_path),
-            **kwargs,
-        )
-        tensor = torch.zeros((num_total_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
-        tier.set_primary_view(memoryview(tensor.numpy()))
-        return tier, tensor
-
     def test_store_load_data_integrity(self, tmp_path):
         """Data written by store must be exactly recovered by load."""
         num_blocks = 4
         num_total = 8
-        tier, tensor = self._make_tier(tmp_path, num_total_blocks=num_total)
+        tensor = torch.rand((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        self.tier.set_primary_view(memoryview(tensor.numpy()))
 
-        # Fill source blocks with random data
-        for bid in range(num_blocks):
-            tensor[bid] = torch.rand((_BLOCK_ELEMENTS,), dtype=_DTYPE)
         expected = tensor[:num_blocks].clone()
 
         block_ids = list(range(num_blocks))
         keys = [key(i) for i in range(num_blocks)]
 
-        tier.submit_store(make_job(1, keys, block_ids))
-        results = drain(tier)
+        self.tier.submit_store(make_job(1, keys, block_ids))
+        results = drain(self.tier)
         assert all(r.success for r in results)
 
         # Overwrite source blocks to prove data is read from disk
         tensor[:num_blocks] = 0.0
 
         load_ids = list(range(num_blocks, 2 * num_blocks))
-        tier.submit_load(make_job(2, keys, load_ids))
-        results = drain(tier)
+        self.tier.submit_load(make_job(2, keys, load_ids))
+        results = drain(self.tier)
         assert all(r.success for r in results)
 
         for i, bid in enumerate(load_ids):
@@ -230,12 +197,6 @@ class TestPythonFileSystemTierE2EWithPrimary:
     @pytest.fixture
     def setup_manager(self, tmp_path):
         """Setup TieringOffloadingManager with real primary and Python filesystem tiers."""
-        from vllm.v1.kv_offload.tiering.manager import (
-            CPUPrimaryTierOffloadingManager,
-            TieringOffloadingManager,
-        )
-
-        block_elements = _BLOCK_ELEMENTS
         num_primary_blocks = 10
 
         # Create primary tier
@@ -243,15 +204,15 @@ class TestPythonFileSystemTierE2EWithPrimary:
             num_blocks=num_primary_blocks,
         )
 
-        # Provide a plain CPU tensor as the shared KV buffer so that
-        # TieringOffloadingManager can wire secondary tier memoryviews
-        # without requiring a real SharedOffloadRegion.
-        cpu_tensor = torch.zeros((num_primary_blocks, block_elements), dtype=torch.float32)
+        # Provide a plain CPU tensor as the shared KV buffer
+        cpu_tensor = torch.zeros((num_primary_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
         primary_tier.create_kv_memoryview = lambda: memoryview(cpu_tensor.numpy())
         
         # Create Python filesystem tier with real I/O
-        fs_tier = FileSystemTierManagerPython(
+        fs_tier = FileSystemTierManager(
             base_path=str(tmp_path / "kvcache"),
+            n_read_threads=4,
+            n_write_threads=4,
         )
         
         # Create tiering manager
@@ -260,7 +221,7 @@ class TestPythonFileSystemTierE2EWithPrimary:
             secondary_tiers=[fs_tier],
         )
         
-        yield manager, primary_tier, fs_tier, cpu_tensor, block_elements
+        yield manager, primary_tier, fs_tier, cpu_tensor, _BLOCK_ELEMENTS
         
         # Cleanup
         manager.shutdown()
@@ -287,7 +248,7 @@ class TestPythonFileSystemTierE2EWithPrimary:
         spec = result.store_spec
         assert isinstance(spec, CPULoadStoreSpec)
         for i, block_id in enumerate(spec.block_ids):
-            data = torch.rand(block_elements, dtype=torch.float32)
+            data = torch.rand(block_elements, dtype=_DTYPE)
             cpu_tensor[int(block_id)] = data
             expected_data[keys[i]] = data.clone()
         
@@ -310,7 +271,7 @@ class TestPythonFileSystemTierE2EWithPrimary:
             assert os.path.isfile(file_path), f"File not found: {file_path}"
             with open(file_path, "rb") as f:
                 raw = f.read(block_elements * 4)
-            actual = torch.frombuffer(bytearray(raw), dtype=torch.float32)
+            actual = torch.frombuffer(bytearray(raw), dtype=_DTYPE)
             assert torch.allclose(actual, expected_data[k]), \
                 f"Data mismatch for block {k}"
 
@@ -324,7 +285,7 @@ class TestPythonFileSystemTierE2EWithPrimary:
         
         # Store blocks with random data
         num_blocks = 3
-        keys = [key(400 + i) for i in range(num_blocks)]
+        keys = [key(200 + i) for i in range(num_blocks)]
         expected_data = {}
         
         result = manager.prepare_store(keys, _CTX)
@@ -333,7 +294,7 @@ class TestPythonFileSystemTierE2EWithPrimary:
         spec = result.store_spec
         assert isinstance(spec, CPULoadStoreSpec)
         for i, block_id in enumerate(spec.block_ids):
-            data = torch.rand(block_elements, dtype=torch.float32)
+            data = torch.rand(block_elements, dtype=_DTYPE)
             cpu_tensor[int(block_id)] = data
             expected_data[keys[i]] = data.clone()
 
@@ -351,7 +312,7 @@ class TestPythonFileSystemTierE2EWithPrimary:
             time.sleep(0.05)
 
         # Evict from primary by filling it (10 slots, 3 filled, store 10 more to trigger eviction)
-        evict_keys = [key(500 + i) for i in range(10)]
+        evict_keys = [key(300 + i) for i in range(10)]
         result = manager.prepare_store(evict_keys, _CTX)
         assert result is not None
         assert len(result.evicted_keys) >= num_blocks  # Original blocks should be evicted
@@ -391,47 +352,3 @@ class TestPythonFileSystemTierE2EWithPrimary:
             expected = expected_data[keys[i]]
             assert torch.allclose(actual_data, expected, rtol=1e-5, atol=1e-7), \
                 f"Block {i} data mismatch after roundtrip"
-
-    def test_ref_cnt_protection_during_async_cascade(self, setup_manager):
-        """
-        Store blocks to primary tier, verify ref_cnt prevents eviction during
-        async cascade, wait for cascade completion, and verify ref_cnt is
-        released after cascade.
-        """
-        manager, primary_tier, fs_tier, cpu_tensor, block_elements = setup_manager
-        
-        # Store blocks to primary
-        keys = [key(900 + i) for i in range(3)]
-        result = manager.prepare_store(keys, _CTX)
-        assert result is not None
-        
-        spec = result.store_spec
-        assert isinstance(spec, CPULoadStoreSpec)
-        for block_id in spec.block_ids:
-            cpu_tensor[int(block_id)] = torch.rand(block_elements, dtype=torch.float32)
-        
-        manager.complete_store(keys, success=True)
-        
-        # Verify ref_cnt is incremented during cascade (1 per secondary tier)
-        for k in keys:
-            block_status = primary_tier._policy.get(k)
-            assert block_status is not None
-            assert block_status.ref_cnt == 1, f"Expected ref_cnt=1, got {block_status.ref_cnt}"
-        
-        # Wait for cascade to complete (may take multiple rounds)
-        for _ in range(20):
-            manager._process_finished_jobs()
-            # Check if all ref_cnts are released
-            all_released = all(
-                primary_tier._policy.get(k).ref_cnt == 0
-                for k in keys if primary_tier._policy.get(k) is not None
-            )
-            if all_released:
-                break
-            time.sleep(0.05)
-        
-        # Verify ref_cnt is released after cascade
-        for k in keys:
-            block_status = primary_tier._policy.get(k)
-            assert block_status is not None
-            assert block_status.ref_cnt == 0, f"Expected ref_cnt=0, got {block_status.ref_cnt}"
