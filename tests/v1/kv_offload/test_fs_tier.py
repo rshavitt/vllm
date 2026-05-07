@@ -155,8 +155,8 @@ class TestPythonFSTierBasic:
     def test_store_load_data_integrity(self, tmp_path):
         """Data written by store must be exactly recovered by load."""
         num_blocks = 4
-        num_total = 8
-        tensor = torch.rand((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        num_total = num_blocks*2
+        tensor = torch.rand((num_total, _BLOCK_ELEMENTS), dtype=_DTYPE)
         self.tier.set_primary_view(memoryview(tensor.numpy()))
 
         expected = tensor[:num_blocks].clone()
@@ -171,7 +171,7 @@ class TestPythonFSTierBasic:
         # Overwrite source blocks to prove data is read from disk
         tensor[:num_blocks] = 0.0
 
-        load_ids = list(range(num_blocks, 2 * num_blocks))
+        load_ids = list(range(num_blocks, num_total))
         self.tier.submit_load(make_job(2, keys, load_ids))
         results = drain(self.tier)
         assert all(r.success for r in results)
