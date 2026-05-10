@@ -37,9 +37,9 @@ from vllm.v1.kv_offload.tiering.base import (
     JobResult,
     SecondaryTierManager,
 )
-from state import JobState
-from thread_pool_nixl import NixlDualQueuePool
-from io_nixl import _run_nixl_load, _run_nixl_store
+from vllm.v1.kv_offload.tiering.fs.thread_pool_nixl import NixlDualQueuePool
+from vllm.v1.kv_offload.tiering.fs.io_nixl import _run_nixl_store, _run_nixl_load
+from vllm.v1.kv_offload.tiering.fs.state import JobState
 try:
     from nixl._api import nixl_agent, nixl_agent_config
 except ImportError as e:

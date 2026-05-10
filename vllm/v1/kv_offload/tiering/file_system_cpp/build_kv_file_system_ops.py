@@ -12,9 +12,13 @@ import shutil
 
 from torch.utils.cpp_extension import load
 
+# Get the vLLM project root directory (6 levels up from this file)
+VLLM_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))))
+
 ext = load(
     name="_kv_file_system_ops",
-    sources=[os.path.join("vllm","csrc", "kv_file_system_ops.cpp")],
+    sources=[os.path.join(VLLM_ROOT, "csrc", "kv_file_system_ops.cpp")],
     extra_cflags=["-O2", "-std=c++17"],
     verbose=True,
 )

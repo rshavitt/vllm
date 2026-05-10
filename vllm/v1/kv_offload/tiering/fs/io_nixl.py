@@ -1,14 +1,7 @@
 
 
 import os
-from state import JobState
-try:
-    from nixl._api import nixl_agent, nixl_agent_config
-except ImportError as e:
-    raise ImportError(
-        "FileSystemTierManagerNixl requires the 'nixl' package. "
-        "Install it with: pip install nixl"
-    ) from e
+from vllm.v1.kv_offload.tiering.fs.state import JobState
 
 def _run_nixl_store(
     agent,
