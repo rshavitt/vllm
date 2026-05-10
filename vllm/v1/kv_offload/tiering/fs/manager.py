@@ -27,9 +27,9 @@ from vllm.v1.kv_offload.tiering.base import (
     JobResult,
     SecondaryTierManager,
 )
-from thread_pool import DualQueueThreadPool
-from fs.io import _store_block, _load_block
-from state import JobState
+from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+from vllm.v1.kv_offload.tiering.fs.io import _store_block, _load_block
+from vllm.v1.kv_offload.tiering.fs.state import JobState
 
 logger = init_logger(__name__)
 

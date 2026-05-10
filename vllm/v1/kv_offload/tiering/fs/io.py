@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from state import JobState
+from vllm.v1.kv_offload.tiering.fs.state import JobState
 
 def _ensure_dirs(path: str) -> None:
     """Create parent directories of *path* if they don't exist."""
@@ -13,7 +13,7 @@ def _store_block(
     buffer: memoryview,
     offset: int,
     block_size: int,
-    state: "JobState",
+    state: JobState,
 ) -> None:
     """
     Store callback: write one KV block atomically, optionally checking if it exists first.
@@ -53,7 +53,7 @@ def _load_block(
     view: memoryview,
     offset: int,
     block_size: int,
-    state: "JobState",
+    state: JobState,
 ) -> None:
     """
     Load callback: read one KV block from disk.
