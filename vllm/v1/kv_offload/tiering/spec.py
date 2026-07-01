@@ -165,10 +165,12 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             # Create TieringOffloadingManager. GPU↔CPU transfers use the inherited
             # get_worker(). Secondary tier transfers are handled by the
             # secondary tier managers and need no additional workers here.
+            skip_primary_tier = bool(self.extra_config.get("skip_primary_tier", False))
             tiering_manager = TieringOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
+                skip_primary_tier=skip_primary_tier,
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(

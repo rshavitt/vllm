@@ -99,6 +99,23 @@ class CPUOffloadingManager(OffloadingManager):
     def _free_block(self, block: BlockStatus) -> None:
         self._free_list.append(block.block_id)
 
+    def evict_if_present(self, key: OffloadKey) -> bool:
+        """Force-evict a key from the CPU tier if it exists and is idle.
+
+        Returns True if the key was evicted (or was never present).
+        Returns False if the block exists but is in-use (ref_cnt != 0),
+        meaning a load or store is in-flight — caller should retry later.
+        """
+        block = self._policy.get(key)
+        if block is None:
+            return True
+        if block.ref_cnt != 0:
+            return False
+        self._policy.remove(key)
+        self._free_block(block)
+        self._num_evictable_cache_blocks -= 1
+        return True
+
     def _get_load_store_spec(
         self,
         keys: Iterable[OffloadKey],

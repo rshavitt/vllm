@@ -141,6 +141,7 @@ class TieringOffloadingManager(OffloadingManager):
         primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
         enable_events: bool = False,
+        skip_primary_tier: bool = False,
     ):
         """
         Initialize the TieringOffloadingManager.
@@ -150,9 +151,13 @@ class TieringOffloadingManager(OffloadingManager):
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
             enable_events: Whether to track offloading events
+            skip_primary_tier: When True, skip CPU primary tier during lookup
+                so all hits come from secondary tiers (e.g., storage). Useful
+                for experiments that need to measure storage load latency.
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+        self.skip_primary_tier = skip_primary_tier
 
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -170,6 +175,13 @@ class TieringOffloadingManager(OffloadingManager):
         self._pending_load_submissions: dict[
             SecondaryTierManager, dict[str, PendingPromotion]
         ] = {}
+
+        # Tracks keys whose FS→CPU promotion just completed while
+        # skip_primary_tier=True. The lookup() short-circuits to the primary
+        # tier for these keys so the request can be scheduled using the
+        # freshly-loaded data. Cleared in prepare_load() after the blocks are
+        # handed to the GPU, so the next hot read triggers a fresh FS load.
+        self._recently_promoted_keys: set[OffloadKey] = set()
 
         # Gate for once-per-step execution of _maybe_process_finished_jobs().
         # Reset at the end of each step in on_schedule_end().
@@ -227,6 +239,12 @@ class TieringOffloadingManager(OffloadingManager):
                         job_metadata.req_context,
                         completed_job.success,
                     )
+                    if self.skip_primary_tier and completed_job.success:
+                        # Record which keys just arrived from secondary storage
+                        # so lookup() can return HIT for them (bypassing the
+                        # usual skip_primary_tier suppression) until prepare_load
+                        # hands them to the GPU and clears the set.
+                        self._recently_promoted_keys.update(job_metadata.keys)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
@@ -259,11 +277,22 @@ class TieringOffloadingManager(OffloadingManager):
         """
         self._maybe_process_finished_jobs()
 
-        primary_hit = self.primary_tier.lookup(key, req_context)
-        if primary_hit is LookupResult.HIT:
-            return LookupResult.HIT
-        if primary_hit is LookupResult.HIT_PENDING:
-            return LookupResult.HIT_PENDING
+        if not self.skip_primary_tier:
+            primary_hit = self.primary_tier.lookup(key, req_context)
+            if primary_hit is LookupResult.HIT:
+                return LookupResult.HIT
+            if primary_hit is LookupResult.HIT_PENDING:
+                return LookupResult.HIT_PENDING
+        elif key in self._recently_promoted_keys:
+            # Block was just promoted from secondary into primary for this
+            # request (FS→CPU completed). Use the primary-tier result so
+            # the request can be scheduled — but only for these freshly-loaded
+            # blocks, not for stale CPU-cache entries from earlier requests.
+            primary_hit = self.primary_tier.lookup(key, req_context)
+            if primary_hit is LookupResult.HIT:
+                return LookupResult.HIT
+            if primary_hit is LookupResult.HIT_PENDING:
+                return LookupResult.HIT_PENDING
 
         any_retry = False
         for tier in self.secondary_tiers:
@@ -312,6 +341,29 @@ class TieringOffloadingManager(OffloadingManager):
             # Primary tier is full; caller should treat the block as unavailable
             # rather than retrying indefinitely.
             return False
+
+        # When skip_primary_tier=True, a non-empty prepare_write() result means
+        # the block is already in CPU from a previous (cold-write) path — it is
+        # stale cache, not data we loaded from secondary storage.  Evict it so
+        # we can allocate a fresh slot for the incoming FS→CPU transfer.
+        if self.skip_primary_tier and not primary_write_result.keys_to_store:
+            if not self.primary_tier.evict_if_present(key):
+                # Block is in-flight (ref_cnt != 0); cannot evict yet.
+                # Signal RETRY without submitting a job — the caller will
+                # retry on the next scheduler step.
+                return True
+            # Eviction succeeded; re-allocate the slot for incoming FS data.
+            primary_write_result = self.primary_tier.prepare_write([key], req_context)
+            if primary_write_result is None:
+                return False
+
+        # Guard against submitting a 0-task job: if keys_to_store is empty
+        # after all the above (e.g. block already in-flight from an earlier
+        # promotion in the same step), there is nothing to enqueue.  Return
+        # True so the caller retries; the in-flight promotion will complete and
+        # _recently_promoted_keys will gate the lookup on the next step.
+        if not primary_write_result.keys_to_store:
+            return True
 
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
@@ -374,6 +426,11 @@ class TieringOffloadingManager(OffloadingManager):
         """
         # Process completed promotions to ensure blocks are ready
         self._maybe_process_finished_jobs()
+
+        if self.skip_primary_tier and self._recently_promoted_keys:
+            # Clear the "just promoted" gate for these keys: once the GPU is
+            # loading them the next hot read should reload from secondary.
+            self._recently_promoted_keys.difference_update(keys)
 
         return self.primary_tier.prepare_load(keys, req_context)
 
