@@ -113,6 +113,20 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         """
         return self._kv_memoryview
 
+    def reuse_for_promotion(self, key: OffloadKey) -> int | None:
+        """Mark an existing idle block as in-flight for overwrite by secondary tier.
+
+        Returns the block_id on success. Returns None if the block is absent
+        or has ref_cnt != 0 (in-use).
+        """
+        block = self._policy.get(key)
+        if block is None or block.ref_cnt != 0:
+            return None
+        block.ref_cnt = -1
+        self._num_evictable_cache_blocks -= 1
+        self._policy.mark_non_evictable(key)
+        return block.block_id
+
     @override
     def shutdown(self) -> None:
         super().shutdown()
@@ -338,37 +352,23 @@ class TieringOffloadingManager(OffloadingManager):
         primary_write_result = self.primary_tier.prepare_write([key], req_context)
 
         if primary_write_result is None:
-            # Primary tier is full; caller should treat the block as unavailable
-            # rather than retrying indefinitely.
             return False
 
-        # When skip_primary_tier=True, a non-empty prepare_write() result means
-        # the block is already in CPU from a previous (cold-write) path — it is
-        # stale cache, not data we loaded from secondary storage.  Evict it so
-        # we can allocate a fresh slot for the incoming FS→CPU transfer.
-        if self.skip_primary_tier and not primary_write_result.keys_to_store:
-            if not self.primary_tier.evict_if_present(key):
-                # Block is in-flight (ref_cnt != 0); cannot evict yet.
-                # Signal RETRY without submitting a job — the caller will
-                # retry on the next scheduler step.
-                return True
-            # Eviction succeeded; re-allocate the slot for incoming FS data.
-            primary_write_result = self.primary_tier.prepare_write([key], req_context)
-            if primary_write_result is None:
-                return False
-
-        # Guard against submitting a 0-task job: if keys_to_store is empty
-        # after all the above (e.g. block already in-flight from an earlier
-        # promotion in the same step), there is nothing to enqueue.  Return
-        # True so the caller retries; the in-flight promotion will complete and
-        # _recently_promoted_keys will gate the lookup on the next step.
         if not primary_write_result.keys_to_store:
-            return True
+            if not self.skip_primary_tier:
+                return True
+            # Reuse the existing CPU slot — FS will overwrite with identical data.
+            block_id = self.primary_tier.reuse_for_promotion(key)
+            if block_id is None:
+                return True  # in-use; retry next step
+            keys_to_store = [key]
+            block_ids = [block_id]
+        else:
+            store_spec = primary_write_result.store_spec
+            assert isinstance(store_spec, CPULoadStoreSpec)
+            keys_to_store = list(primary_write_result.keys_to_store)
+            block_ids = list(store_spec.block_ids)
 
-        store_spec = primary_write_result.store_spec
-        assert isinstance(store_spec, CPULoadStoreSpec)
-        # Defer submit_load to on_schedule_end(). Group by (tier, request) so
-        # each request's blocks are submitted as one batched job per tier.
         tier_pending = self._pending_load_submissions.setdefault(tier, {})
         ctx_id = req_context.req_id
         if ctx_id not in tier_pending:
@@ -376,8 +376,8 @@ class TieringOffloadingManager(OffloadingManager):
                 keys=[], block_ids=[], req_context=req_context
             )
         entry = tier_pending[ctx_id]
-        entry.keys.extend(primary_write_result.keys_to_store)
-        entry.block_ids.extend(store_spec.block_ids)
+        entry.keys.extend(keys_to_store)
+        entry.block_ids.extend(block_ids)
         return True
 
     def _flush_pending_promotions(self) -> None:
