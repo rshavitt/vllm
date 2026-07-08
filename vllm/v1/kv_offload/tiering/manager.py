@@ -219,6 +219,11 @@ class TieringOffloadingManager(OffloadingManager):
         # Reset at the end of each step in on_schedule_end().
         self._processed_jobs_this_step: bool = False
 
+        # Keys that were promoted from secondary tiers and are now ready in
+        # primary. Used to distinguish post-promotion hits (expected) from
+        # cached hits (unexpected when TIERING_ALWAYS_FROM_STORAGE is set).
+        self._promoted_keys: set[OffloadKey] = set()
+
         # Per-request state for prepared GPU->primary stores and finalization.
         # Secondary tiers are finalized only after pending primary stores reach
         # complete_store(), since complete_store() can still submit cascades.
@@ -325,6 +330,9 @@ class TieringOffloadingManager(OffloadingManager):
                     # secondary→primary transfer (promotion) completed.
                     # Make blocks available in primary tier.
                     self._complete_promotion(job_metadata, completed_job)
+                    if completed_job.success:
+                        self._promoted_keys.update(
+                            job_metadata.transfer_job.keys)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
@@ -378,6 +386,10 @@ class TieringOffloadingManager(OffloadingManager):
             lookup_duration,
         )
         if primary_hit is LookupResult.HIT:
+            if key in self._promoted_keys:
+                self._promoted_keys.discard(key)
+            else:
+                logger.warning("!!! TRUE CPU CACHE HIT (no promotion) key=%s !!!", key)
             return LookupResult.HIT
         if primary_hit is LookupResult.HIT_PENDING:
             return LookupResult.HIT_PENDING
@@ -843,6 +855,7 @@ class TieringOffloadingManager(OffloadingManager):
         # reset below invalidates; their submit_load() has not yet been
         # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
+        self._promoted_keys.clear()
         self._metrics.assert_idle()
 
         finished_req_ids = []
