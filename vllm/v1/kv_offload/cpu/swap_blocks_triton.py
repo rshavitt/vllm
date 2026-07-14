@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import torch
 
-from vllm import _custom_ops as ops
 from vllm.triton_utils import tl, triton
 
 # Constants tuned empirically on H100 (PCIe Gen5):
@@ -53,19 +52,13 @@ def swap_blocks_batch(
     is_src_access_order_any: bool = False,
     *,
     bytes_per_chunk: int,
+    num_sms: int = NUM_SMS,
 ) -> None:
-    """Triton implementation of ``swap_blocks_batch`` for small CPU->GPU batches."""
+    """Triton implementation of ``swap_blocks_batch``."""
     n = src_addrs.numel()
-    # Too few descriptors to amortize Triton's launch cost.
-    if n < MIN_N:
-        ops.swap_blocks_batch(
-            src_addrs,
-            dst_addrs,
-            sizes,
-            is_src_access_order_any=is_src_access_order_any,
-        )
+    if n == 0:
         return
-    _swap_blocks_kernel[(min(NUM_SMS, n),)](
+    _swap_blocks_kernel[(min(num_sms, n),)](
         src_addrs.to("cuda", non_blocking=True),
         dst_addrs.to("cuda", non_blocking=True),
         sizes.to("cuda", non_blocking=True),

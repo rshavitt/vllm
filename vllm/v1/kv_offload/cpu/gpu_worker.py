@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.math_utils import cdiv
+from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
@@ -32,27 +34,43 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 logger = init_logger(__name__)
 
 
+_USE_TRITON_KERNEL = os.environ.get("VLLM_OFFLOAD_USE_TRITON_KERNEL", "0") == "1"
+
+
 def _select_swap_blocks_fn(
     kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
     gpu_to_cpu: bool,
 ):
     """Resolve the swap_blocks function for a handler at init time."""
-    # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
-    if gpu_to_cpu:
-        return ops.swap_blocks_batch
-    # Fall back to the C++ DMA path on platforms where Triton isn't usable
-    # (e.g. ROCm builds without Triton) or where GPU kernels cannot directly
-    # dereference CPU pointers (XPU lacks CUDA's unified virtual address space,
-    # so the Triton kernel's tl.load(cpu_ptr) is invalid on XPU).
     if not HAS_TRITON or current_platform.is_xpu():
         return ops.swap_blocks_batch
     page_sizes = [r.page_size_bytes for g in kv_cache_groups_data_refs for r in g]
-    # Triton wins only on small, 8-byte-aligned payloads.
-    if (
-        not page_sizes
-        or max(page_sizes) >= THRESHOLD_BYTES
-        or any(s % 8 for s in page_sizes)
-    ):
+    if not page_sizes or any(s % 8 for s in page_sizes):
+        return ops.swap_blocks_batch
+
+    if _USE_TRITON_KERNEL:
+        # Benchmark mode: use Triton kernel for all directions and sizes,
+        # with all available SMs.
+        chunk = min(triton.next_power_of_2(max(page_sizes)), 8192)
+        all_sms = num_compute_units()
+        direction = "GPU->CPU" if gpu_to_cpu else "CPU->GPU"
+        logger.info(
+            "[BENCHMARK] Using Triton kernel for %s transfers "
+            "(%d SMs, chunk=%d, max_page=%d bytes)",
+            direction,
+            all_sms,
+            chunk,
+            max(page_sizes),
+        )
+        return functools.partial(
+            swap_blocks_batch, bytes_per_chunk=chunk, num_sms=all_sms
+        )
+
+    # Default production path.
+    # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
+    if gpu_to_cpu:
+        return ops.swap_blocks_batch
+    if max(page_sizes) >= THRESHOLD_BYTES:
         return ops.swap_blocks_batch
     chunk = min(triton.next_power_of_2(max(page_sizes)), 8192)
     return functools.partial(swap_blocks_batch, bytes_per_chunk=chunk)
