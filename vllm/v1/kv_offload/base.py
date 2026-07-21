@@ -522,6 +522,10 @@ class OffloadingSpec(ABC):
             self.extra_config.get("offload_prompt_only", True)
         )
 
+        self.min_prompt_tokens_for_lookup: int = int(
+            self.extra_config.get("min_prompt_tokens_for_lookup", 0)
+        )
+
         parallel_config = vllm_config.parallel_config
         context_parallel_factor = (
             parallel_config.decode_context_parallel_size
