@@ -7,6 +7,7 @@ import mmap
 import os
 import random
 import threading
+import time
 
 try:
     from vllm.fs_io_C import (  # pyright: ignore[reportMissingImports]
@@ -186,8 +187,17 @@ def batch_store_block(
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
         return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
     else:
+        timings = []
         for path, offset in zip(paths, offsets):
+            t0 = time.perf_counter()
             _store_block(path, view, offset, block_size, use_o_direct)
+            timings.append((time.perf_counter() - t0) * 1000)
+        if timings:
+            logger.info(
+                "FS_TIMING store: %d blocks, avg %.3f ms/block",
+                len(timings),
+                sum(timings) / len(timings),
+            )
 
 
 def batch_load_block(
@@ -212,11 +222,20 @@ def batch_load_block(
         view_slices = [view_B[x : x + block_size] for x in offsets]
         return batch_load_block_C(paths, view_slices, use_o_direct)
     else:
+        timings = []
         for i, (path, offset) in enumerate(zip(paths, offsets)):
             try:
+                t0 = time.perf_counter()
                 _load_block(path, view, offset, block_size, use_o_direct)
+                timings.append((time.perf_counter() - t0) * 1000)
             except OSError as exc:
                 # Blocks 0..i-1 loaded fine; record the count for partial keep.
                 # The C path sets the same attribute via PyObject_SetAttrString.
                 exc.num_succeeded = i  # type: ignore[attr-defined]
                 raise
+        if timings:
+            logger.info(
+                "FS_TIMING load: %d blocks, avg %.3f ms/block",
+                len(timings),
+                sum(timings) / len(timings),
+            )

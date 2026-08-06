@@ -18,6 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
@@ -78,9 +79,24 @@ class FsAsyncLookupManager(AsyncLookupManager):
     ) -> Iterable[bool]:
         paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
         if _HAS_BATCH_LOOKUP_C:
-            # C extension: GIL released for the entire faccessat() batch.
-            return batch_lookup_C(paths)
-        return (os.path.exists(p) for p in paths)
+            t0 = time.perf_counter()
+            results = list(batch_lookup_C(paths))
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "FS_TIMING lookup: %d keys, avg %.3f ms/key",
+                len(keys),
+                elapsed_ms / max(len(keys), 1),
+            )
+            return results
+        t0 = time.perf_counter()
+        results = [os.path.exists(p) for p in paths]
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "FS_TIMING lookup: %d keys, avg %.3f ms/key",
+            len(keys),
+            elapsed_ms / max(len(keys), 1),
+        )
+        return results
 
 
 class FileSystemTierManager(SecondaryTierManager):
