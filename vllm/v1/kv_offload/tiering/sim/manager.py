@@ -77,18 +77,20 @@ class SimulatedTierManager(SecondaryTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         lookup_delay_ms: float = 0.0,
-        read_delay_ms: float = 0.0,
-        write_delay_ms: float = 0.0,
-        base_overhead_ms: float = 0.0,
+        block_read_delay_ms: float = 0.0,
+        block_write_delay_ms: float = 0.0,
+        read_overhead_ms: float = 0.0,
+        write_overhead_ms: float = 0.0,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
         self._lookup_delay_s = lookup_delay_ms / 1000.0
-        self._read_delay_s = read_delay_ms / 1000.0
-        self._write_delay_s = write_delay_ms / 1000.0
-        self._base_overhead_s = base_overhead_ms / 1000.0
+        self._block_read_delay_s = block_read_delay_ms / 1000.0
+        self._block_write_delay_s = block_write_delay_ms / 1000.0
+        self._read_overhead_s = read_overhead_ms / 1000.0
+        self._write_overhead_s = write_overhead_ms / 1000.0
 
         assert primary_kv_view.strides is not None, (
             "primary_kv_view.strides cannot be None"
@@ -98,9 +100,6 @@ class SimulatedTierManager(SecondaryTierManager):
         self.locality = None
         self._stored_keys: set[OffloadKey] = set()
         self._stored_keys_lock = threading.Lock()
-
-        self._zero_buf = bytes(self._block_size)
-        self._use_o_direct = False
 
         self._pool = DualQueueThreadPool(
             n_read_threads,
@@ -116,11 +115,13 @@ class SimulatedTierManager(SecondaryTierManager):
 
         logger.info(
             "SimulatedTierManager initialized: lookup=%.1fms, "
-            "read=%.1fms, write=%.1fms, base_overhead=%.1fms, threads=%d+%d",
+            "block_read=%.1fms, block_write=%.1fms, "
+            "read_overhead=%.1fms, write_overhead=%.1fms, threads=%d+%d",
             lookup_delay_ms,
-            read_delay_ms,
-            write_delay_ms,
-            base_overhead_ms,
+            block_read_delay_ms,
+            block_write_delay_ms,
+            read_overhead_ms,
+            write_overhead_ms,
             n_read_threads,
             n_write_threads,
         )
@@ -147,12 +148,14 @@ class SimulatedTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
-                self._write_delay_s,
+                self._block_write_delay_s,
                 self._stored_keys,
                 self._stored_keys_lock,
-                self._use_o_direct,
+                self._write_overhead_s if i == 0 else 0.0,
             )
-            for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
+            for i, (key, bid) in enumerate(
+                zip(job_metadata.keys, job_metadata.block_ids)
+            )
         )
         self._pool.enqueue_store(job_metadata.job_id, len(job_metadata.keys), tasks)
 
@@ -165,12 +168,14 @@ class SimulatedTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
-                self._read_delay_s,
+                self._block_read_delay_s,
                 self._stored_keys,
                 self._stored_keys_lock,
-                self._use_o_direct,
+                self._read_overhead_s if i == 0 else 0.0,
             )
-            for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
+            for i, (key, bid) in enumerate(
+                zip(job_metadata.keys, job_metadata.block_ids)
+            )
         )
         self._pool.enqueue_load(job_metadata.job_id, len(job_metadata.keys), tasks)
 

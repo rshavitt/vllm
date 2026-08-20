@@ -83,20 +83,14 @@ def _store_block(
     buffer: memoryview,
     offset: int,
     block_size: int,
-    write_delay_ms: float,
+    block_write_delay_s: float,
     stored_keys,
     stored_keys_lock,
-    use_o_direct: bool = True,
+    write_overhead_s: float = 0.0,
 ) -> None:
-    """
-    Store callback: Writes to a temp file then atomically replaces the destination.
-    """
-    # Check if block already exists to avoid redundant writes
     if key in stored_keys:
         return
-
-    time.sleep(write_delay_ms)
-
+    time.sleep(block_write_delay_s + write_overhead_s)
     with stored_keys_lock:
         stored_keys.add(key)
 
@@ -106,16 +100,12 @@ def _load_block(
     view: memoryview,
     offset: int,
     block_size: int,
-    read_delay_ms: float,
+    block_read_delay_s: float,
     stored_keys,
     stored_keys_lock,
-    use_o_direct: bool = True,
+    read_overhead_s: float = 0.0,
 ) -> None:
-    """
-    Load callback: read one KV block from disk. Remove the file on failure.
-    """
-    time.sleep(read_delay_ms)
-
+    time.sleep(block_read_delay_s + read_overhead_s)
     with stored_keys_lock:
         stored_keys.add(key)
 
@@ -125,30 +115,12 @@ def batch_store_block(
     view: memoryview,
     offsets: list[int],
     block_size: int,
-    write_delay_ms: float,
     stored_keys,
     stored_keys_lock,
-    use_o_direct: bool = True,
 ) -> None:
-    """
-    Store a batch of KV blocks from a shared buffer to disk in one call.
-
-    Each block buffer[offsets[i] : offsets[i]+block_size] is written atomically
-    to dest_paths[i] via a temp-file rename.  Raises on first error.
-    """
     _validate_offsets(view, offsets, block_size)
-
     for key, offset in zip(keys, offsets):
-        _store_block(
-            key,
-            view,
-            offset,
-            block_size,
-            write_delay_ms,
-            stored_keys,
-            stored_keys_lock,
-            use_o_direct,
-        )
+        _store_block(key, view, offset, block_size, 0.0, stored_keys, stored_keys_lock)
 
 
 def batch_load_block(
@@ -156,31 +128,9 @@ def batch_load_block(
     view: memoryview,
     offsets: list[int],
     block_size: int,
-    read_delay_ms: float,
     stored_keys,
     stored_keys_lock,
-    use_o_direct: bool = True,
-    base_overhead_s: float = 0.0,
 ) -> None:
-    """
-    Load a batch of KV blocks from disk into a shared buffer in one call.
-
-    Block i is read from source_paths[i] into view[offsets[i] : offsets[i]+block_size].
-    Raises on first error and removes the offending file.
-    """
     _validate_offsets(view, offsets, block_size)
-
-    if base_overhead_s > 0:
-        time.sleep(base_overhead_s)
-
     for key, offset in zip(keys, offsets):
-        _load_block(
-            key,
-            view,
-            offset,
-            block_size,
-            read_delay_ms,
-            stored_keys,
-            stored_keys_lock,
-            use_o_direct,
-        )
+        _load_block(key, view, offset, block_size, 0.0, stored_keys, stored_keys_lock)
