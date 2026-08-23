@@ -34,6 +34,7 @@ from vllm.v1.kv_offload.tiering.base import (
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 from vllm.v1.kv_offload.tiering.sim.io import (
+    BandwidthLimiter,
     _load_block,
     _store_block,
 )
@@ -77,8 +78,8 @@ class SimulatedTierManager(SecondaryTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         lookup_delay_ms: float = 0.0,
-        block_read_delay_ms: float = 0.0,
-        block_write_delay_ms: float = 0.0,
+        read_bandwidth_mb_s: float = 1000.0,
+        write_bandwidth_mb_s: float = 1000.0,
         read_overhead_ms: float = 0.0,
         write_overhead_ms: float = 0.0,
         n_read_threads: int = 16,
@@ -87,8 +88,6 @@ class SimulatedTierManager(SecondaryTierManager):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
         self._lookup_delay_s = lookup_delay_ms / 1000.0
-        self._block_read_delay_s = block_read_delay_ms / 1000.0
-        self._block_write_delay_s = block_write_delay_ms / 1000.0
         self._read_overhead_s = read_overhead_ms / 1000.0
         self._write_overhead_s = write_overhead_ms / 1000.0
 
@@ -96,6 +95,9 @@ class SimulatedTierManager(SecondaryTierManager):
             "primary_kv_view.strides cannot be None"
         )
         self._block_size: int = primary_kv_view.strides[0]
+
+        self._read_limiter = BandwidthLimiter(read_bandwidth_mb_s * 1024 * 1024)
+        self._write_limiter = BandwidthLimiter(write_bandwidth_mb_s * 1024 * 1024)
 
         self.locality = None
         self._stored_keys: set[OffloadKey] = set()
@@ -115,11 +117,11 @@ class SimulatedTierManager(SecondaryTierManager):
 
         logger.info(
             "SimulatedTierManager initialized: lookup=%.1fms, "
-            "block_read=%.1fms, block_write=%.1fms, "
+            "read_bw=%.1f MB/s, write_bw=%.1f MB/s, "
             "read_overhead=%.1fms, write_overhead=%.1fms, threads=%d+%d",
             lookup_delay_ms,
-            block_read_delay_ms,
-            block_write_delay_ms,
+            read_bandwidth_mb_s,
+            write_bandwidth_mb_s,
             read_overhead_ms,
             write_overhead_ms,
             n_read_threads,
@@ -141,6 +143,8 @@ class SimulatedTierManager(SecondaryTierManager):
     def submit_store(self, job_metadata: JobMetadata) -> None:
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+        if self._write_overhead_s > 0:
+            self._write_limiter.reserve_overhead(self._write_overhead_s)
         tasks = (
             functools.partial(
                 _store_block,
@@ -148,19 +152,18 @@ class SimulatedTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
-                self._block_write_delay_s,
+                self._write_limiter,
                 self._stored_keys,
                 self._stored_keys_lock,
-                self._write_overhead_s if i == 0 else 0.0,
             )
-            for i, (key, bid) in enumerate(
-                zip(job_metadata.keys, job_metadata.block_ids)
-            )
+            for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
         self._pool.enqueue_store(job_metadata.job_id, len(job_metadata.keys), tasks)
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        if self._read_overhead_s > 0:
+            self._read_limiter.reserve_overhead(self._read_overhead_s)
         tasks = (
             functools.partial(
                 _load_block,
@@ -168,14 +171,11 @@ class SimulatedTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
-                self._block_read_delay_s,
+                self._read_limiter,
                 self._stored_keys,
                 self._stored_keys_lock,
-                self._read_overhead_s if i == 0 else 0.0,
             )
-            for i, (key, bid) in enumerate(
-                zip(job_metadata.keys, job_metadata.block_ids)
-            )
+            for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
         self._pool.enqueue_load(job_metadata.job_id, len(job_metadata.keys), tasks)
 
