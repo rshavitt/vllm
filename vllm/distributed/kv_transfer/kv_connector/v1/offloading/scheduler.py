@@ -136,6 +136,7 @@ class SchedulerOffloadConfig(NamedTuple):
     blocks_per_chunk: int
     num_workers: int
     offload_prompt_only: bool
+    min_prompt_tokens_for_lookup: int
 
     @classmethod
     def from_spec(
@@ -227,6 +228,7 @@ class SchedulerOffloadConfig(NamedTuple):
             ),
             blocks_per_chunk=spec.blocks_per_chunk,
             offload_prompt_only=spec.offload_prompt_only,
+            min_prompt_tokens_for_lookup=spec.min_prompt_tokens_for_lookup,
         )
 
 
@@ -754,7 +756,10 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
-        if request.skip_reading_prefix_cache:
+        if (
+            request.skip_reading_prefix_cache
+            or request.num_prompt_tokens < self.config.min_prompt_tokens_for_lookup
+        ):
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()

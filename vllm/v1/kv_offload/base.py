@@ -511,6 +511,10 @@ class OffloadingSpec(ABC):
             self.extra_config.get("offload_prompt_only", True)
         )
 
+        self.min_prompt_tokens_for_lookup: int = int(
+            self.extra_config.get("min_prompt_tokens_for_lookup", 0)
+        )
+
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
         self.tokens_per_hash = config.cache.tokens_per_hash
         self.blocks_per_chunk = config.cache.blocks_per_chunk
