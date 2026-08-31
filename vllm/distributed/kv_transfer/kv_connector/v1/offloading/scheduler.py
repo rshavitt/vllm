@@ -943,6 +943,9 @@ class OffloadingConnectorScheduler:
                 continue
             req = req_status.req
 
+            if req.num_prompt_tokens < self.config.min_prompt_tokens_for_lookup:
+                continue
+
             if req.is_finished():
                 num_tokens_after_batch = req.num_tokens
             else:
