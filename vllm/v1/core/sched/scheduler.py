@@ -266,11 +266,13 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        connector_active = self.connector is not None
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
-            enable_caching=self.cache_config.enable_prefix_caching,
+            enable_caching=self.cache_config.enable_prefix_caching or connector_active,
+            enable_prefix_cache_lookup=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,

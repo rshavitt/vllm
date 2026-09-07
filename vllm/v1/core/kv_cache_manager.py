@@ -120,6 +120,7 @@ class KVCacheManager:
         hash_block_size: int,
         max_in_flight_tokens: int | None = None,
         enable_caching: bool = True,
+        enable_prefix_cache_lookup: bool = True,
         use_eagle: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
@@ -136,6 +137,7 @@ class KVCacheManager:
             max_in_flight_tokens = max_model_len
 
         self.enable_caching = enable_caching
+        self.enable_prefix_cache_lookup = enable_prefix_cache_lookup
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -225,7 +227,7 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
+        if not self.enable_prefix_cache_lookup or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
