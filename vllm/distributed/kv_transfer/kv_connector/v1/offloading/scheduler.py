@@ -369,6 +369,7 @@ class OffloadingConnectorScheduler:
         self.config = SchedulerOffloadConfig.from_spec(
             spec, vllm_config, kv_cache_config
         )
+        self.min_prompt_tokens_for_lookup = self.config.min_prompt_tokens_for_lookup
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
 
@@ -758,7 +759,7 @@ class OffloadingConnectorScheduler:
         num_hit_tokens: int | None
         if (
             request.skip_reading_prefix_cache
-            or request.num_prompt_tokens < self.config.min_prompt_tokens_for_lookup
+            or request.num_prompt_tokens < self.min_prompt_tokens_for_lookup
         ):
             num_hit_tokens = 0
         else:
@@ -943,7 +944,7 @@ class OffloadingConnectorScheduler:
                 continue
             req = req_status.req
 
-            if req.num_prompt_tokens < self.config.min_prompt_tokens_for_lookup:
+            if req.num_prompt_tokens < self.min_prompt_tokens_for_lookup:
                 continue
 
             if req.is_finished():
