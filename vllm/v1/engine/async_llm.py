@@ -925,6 +925,9 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    async def set_min_prompt_tokens_for_lookup(self, value: int) -> None:
+        await self.engine_core.set_min_prompt_tokens_for_lookup_async(value)
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 

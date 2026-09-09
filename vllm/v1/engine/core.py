@@ -783,6 +783,11 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def set_min_prompt_tokens_for_lookup(self, value: int) -> None:
+        connector = self.scheduler.get_kv_connector()
+        if connector is not None and hasattr(connector, "connector_scheduler"):
+            connector.connector_scheduler.min_prompt_tokens_for_lookup = value
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

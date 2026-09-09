@@ -154,6 +154,9 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    def set_min_prompt_tokens_for_lookup(self, value: int) -> None:
+        raise NotImplementedError
+
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
@@ -229,6 +232,9 @@ class EngineCoreClient(ABC):
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
+        raise NotImplementedError
+
+    async def set_min_prompt_tokens_for_lookup_async(self, value: int) -> None:
         raise NotImplementedError
 
     async def reset_encoder_cache_async(self) -> None:
@@ -317,6 +323,9 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def set_min_prompt_tokens_for_lookup(self, value: int) -> None:
+        self.engine_core.set_min_prompt_tokens_for_lookup(value)
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
@@ -905,6 +914,9 @@ class SyncMPClient(MPClient):
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
 
+    def set_min_prompt_tokens_for_lookup(self, value: int) -> None:
+        self.call_utility("set_min_prompt_tokens_for_lookup", value)
+
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
@@ -1152,6 +1164,9 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
+
+    async def set_min_prompt_tokens_for_lookup_async(self, value: int) -> None:
+        await self.call_utility_async("set_min_prompt_tokens_for_lookup", value)
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")

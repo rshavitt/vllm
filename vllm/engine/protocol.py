@@ -161,6 +161,9 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def set_min_prompt_tokens_for_lookup(self, value: int) -> None: ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
         """Sleep the engine"""
         ...

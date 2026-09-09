@@ -66,5 +66,13 @@ async def reset_encoder_cache(raw_request: Request):
     return Response(status_code=200)
 
 
+@router.post("/set_min_prompt_tokens_for_lookup")
+async def set_min_prompt_tokens_for_lookup(raw_request: Request):
+    body = await raw_request.json()
+    value = int(body["value"])
+    await engine_client(raw_request).set_min_prompt_tokens_for_lookup(value)
+    return Response(status_code=200)
+
+
 def attach_router(app: FastAPI):
     app.include_router(router)
