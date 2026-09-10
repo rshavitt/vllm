@@ -137,6 +137,7 @@ class SchedulerOffloadConfig(NamedTuple):
     num_workers: int
     offload_prompt_only: bool
     min_prompt_tokens_for_lookup: int
+    offload_by_threshold: bool
 
     @classmethod
     def from_spec(
@@ -229,6 +230,7 @@ class SchedulerOffloadConfig(NamedTuple):
             blocks_per_chunk=spec.blocks_per_chunk,
             offload_prompt_only=spec.offload_prompt_only,
             min_prompt_tokens_for_lookup=spec.min_prompt_tokens_for_lookup,
+            offload_by_threshold=spec.offload_by_threshold,
         )
 
 
@@ -944,7 +946,10 @@ class OffloadingConnectorScheduler:
                 continue
             req = req_status.req
 
-            if req.num_prompt_tokens < self.min_prompt_tokens_for_lookup:
+            if (
+                self.config.offload_by_threshold
+                and req.num_prompt_tokens < self.min_prompt_tokens_for_lookup
+            ):
                 continue
 
             if req.is_finished():
