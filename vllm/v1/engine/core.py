@@ -787,6 +787,12 @@ class EngineCore:
         connector = self.scheduler.get_kv_connector()
         if connector is not None and hasattr(connector, "connector_scheduler"):
             connector.connector_scheduler.min_prompt_tokens_for_lookup = value
+            manager = connector.connector_scheduler.manager
+            if hasattr(manager, "secondary_tiers"):
+                for tier in manager.secondary_tiers:
+                    if hasattr(tier, "_stored_keys"):
+                        with tier._stored_keys_lock:
+                            tier._stored_keys.clear()
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
