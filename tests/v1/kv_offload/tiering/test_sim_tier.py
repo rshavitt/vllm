@@ -264,7 +264,9 @@ class TestDelays:
 
 
 class TestQueueBalancing:
-    def _make_balancing_tier(self, enable: bool = True) -> SimulatedTierManager:
+    def _make_balancing_tier(
+        self, enable: bool = True, prefill_ratio: float = 1.0
+    ) -> SimulatedTierManager:
         return SimulatedTierManager(
             offloading_spec=_MOCK_SPEC,
             primary_kv_view=_make_primary_view(),
@@ -272,6 +274,7 @@ class TestQueueBalancing:
             n_read_threads=2,
             n_write_threads=2,
             enable_queue_balancing=enable,
+            prefill_ratio=prefill_ratio,
         )
 
     def _fill_load_queue(self, tier: SimulatedTierManager, count: int):
@@ -354,6 +357,45 @@ class TestQueueBalancing:
 
             assert results == [False, False, False, False]
             assert t._prefill_queue_blocks == 0
+        finally:
+            t.shutdown()
+
+    def test_low_prefill_ratio(self):
+        # ratio=0.25, load_q=20 → prefill target = 5 blocks
+        # First 4-block request fits (4 < 5), second doesn't (8 >= 5)
+        t = self._make_balancing_tier(prefill_ratio=0.25)
+        try:
+            t._stored_keys = {_to_key(i) for i in range(8)}
+            self._fill_load_queue(t, 20)
+
+            keys1 = [_to_key(i) for i in range(4)]
+            r1 = list(t._lookup_manager.batch_lookup(keys1, ReqContext(req_id="r1")))
+            assert r1 == [False, False, False, False]
+            assert t._prefill_queue_blocks == 4
+
+            keys2 = [_to_key(i) for i in range(4, 8)]
+            r2 = list(t._lookup_manager.batch_lookup(keys2, ReqContext(req_id="r2")))
+            assert r2 == [True, True, True, True]
+            assert t._prefill_queue_blocks == 4
+        finally:
+            t.shutdown()
+
+    def test_high_prefill_ratio(self):
+        # ratio=2.0, load_q=20 → prefill target = 40 blocks
+        # Two 4-block requests both fit (4 < 40, 8 < 40)
+        t = self._make_balancing_tier(prefill_ratio=2.0)
+        try:
+            t._stored_keys = {_to_key(i) for i in range(8)}
+            self._fill_load_queue(t, 20)
+
+            keys1 = [_to_key(i) for i in range(4)]
+            r1 = list(t._lookup_manager.batch_lookup(keys1, ReqContext(req_id="r1")))
+            assert r1 == [False, False, False, False]
+
+            keys2 = [_to_key(i) for i in range(4, 8)]
+            r2 = list(t._lookup_manager.batch_lookup(keys2, ReqContext(req_id="r2")))
+            assert r2 == [False, False, False, False]
+            assert t._prefill_queue_blocks == 8
         finally:
             t.shutdown()
 
