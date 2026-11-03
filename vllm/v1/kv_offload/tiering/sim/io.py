@@ -67,5 +67,6 @@ def _load_block(
     stored_keys_lock: threading.Lock,
 ) -> None:
     bandwidth_limiter.acquire(block_size)
+    view.cast("B")[offset : offset + block_size] = b"\x00" * block_size
     with stored_keys_lock:
         stored_keys.add(key)
