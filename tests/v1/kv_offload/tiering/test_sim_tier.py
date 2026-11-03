@@ -43,8 +43,6 @@ def _make_primary_view(
 def _make_tier(
     primary_view: memoryview | None = None,
     lookup_delay_ms: float = 0.0,
-    read_delay_ms: float = 0.0,
-    write_delay_ms: float = 0.0,
     n_read_threads: int = 2,
     n_write_threads: int = 2,
 ) -> SimulatedTierManager:
@@ -55,8 +53,6 @@ def _make_tier(
         primary_kv_view=primary_view,
         tier_type="sim",
         lookup_delay_ms=lookup_delay_ms,
-        read_delay_ms=read_delay_ms,
-        write_delay_ms=write_delay_ms,
         n_read_threads=n_read_threads,
         n_write_threads=n_write_threads,
     )
@@ -224,21 +220,35 @@ class TestLoad:
 
 
 class TestDelays:
-    def test_write_delay_is_applied(self):
-        delay_ms = 50
-        t = _make_tier(write_delay_ms=delay_ms)
+    def test_write_overhead_is_applied(self):
+        overhead_ms = 50
+        t = SimulatedTierManager(
+            offloading_spec=_MOCK_SPEC,
+            primary_kv_view=_make_primary_view(),
+            tier_type="sim",
+            write_overhead_ms=overhead_ms,
+            n_read_threads=2,
+            n_write_threads=2,
+        )
         try:
             start = time.monotonic()
             t.submit_store(_make_job(0, [0]))
             t.drain_jobs()
             elapsed_ms = (time.monotonic() - start) * 1000
-            assert elapsed_ms >= delay_ms * 0.9
+            assert elapsed_ms >= overhead_ms * 0.9
         finally:
             t.shutdown()
 
-    def test_read_delay_is_applied(self):
-        delay_ms = 50
-        t = _make_tier(read_delay_ms=delay_ms)
+    def test_read_overhead_is_applied(self):
+        overhead_ms = 50
+        t = SimulatedTierManager(
+            offloading_spec=_MOCK_SPEC,
+            primary_kv_view=_make_primary_view(),
+            tier_type="sim",
+            read_overhead_ms=overhead_ms,
+            n_read_threads=2,
+            n_write_threads=2,
+        )
         try:
             t.submit_store(_make_job(0, [0]))
             t.drain_jobs()
@@ -248,7 +258,102 @@ class TestDelays:
             t.submit_load(_make_job(1, [0]))
             t.drain_jobs()
             elapsed_ms = (time.monotonic() - start) * 1000
-            assert elapsed_ms >= delay_ms * 0.9
+            assert elapsed_ms >= overhead_ms * 0.9
+        finally:
+            t.shutdown()
+
+
+class TestQueueBalancing:
+    def _make_balancing_tier(self, enable: bool = True) -> SimulatedTierManager:
+        return SimulatedTierManager(
+            offloading_spec=_MOCK_SPEC,
+            primary_kv_view=_make_primary_view(),
+            tier_type="sim",
+            n_read_threads=2,
+            n_write_threads=2,
+            enable_queue_balancing=enable,
+        )
+
+    def _fill_load_queue(self, tier: SimulatedTierManager, count: int):
+        """Add no-op tasks to the load queue to simulate backlog."""
+        from vllm.v1.kv_offload.tiering.fs.thread_pool import JobState
+
+        with tier._pool._condition:
+            for _ in range(count):
+                tier._pool._load_q.append((lambda: None, JobState(-1, 1)))
+
+    def test_forces_prefill_when_load_queue_larger(self):
+        t = self._make_balancing_tier(enable=True)
+        try:
+            t._stored_keys = {_to_key(i) for i in range(4)}
+            self._fill_load_queue(t, 20)
+
+            keys = [_to_key(i) for i in range(4)]
+            ctx = ReqContext(req_id="bal-1")
+            results = list(t._lookup_manager.batch_lookup(keys, ctx))
+
+            assert results == [False, False, False, False]
+            assert t._prefill_queue_blocks == 4
+            assert t._req_prefill_blocks["bal-1"] == 4
+        finally:
+            t.shutdown()
+
+    def test_normal_hit_when_queues_balanced(self):
+        t = self._make_balancing_tier(enable=True)
+        try:
+            t._stored_keys = {_to_key(i) for i in range(4)}
+
+            keys = [_to_key(i) for i in range(4)]
+            ctx = ReqContext(req_id="bal-2")
+            results = list(t._lookup_manager.batch_lookup(keys, ctx))
+
+            assert results == [True, True, True, True]
+            assert t._prefill_queue_blocks == 0
+        finally:
+            t.shutdown()
+
+    def test_prefill_counter_decrements_on_request_finish(self):
+        t = self._make_balancing_tier(enable=True)
+        try:
+            t._stored_keys = {_to_key(i) for i in range(4)}
+            self._fill_load_queue(t, 20)
+
+            keys = [_to_key(i) for i in range(4)]
+            ctx = ReqContext(req_id="bal-3")
+            list(t._lookup_manager.batch_lookup(keys, ctx))
+            assert t._prefill_queue_blocks == 4
+
+            t.on_request_finished(ctx)
+            assert t._prefill_queue_blocks == 0
+            assert "bal-3" not in t._req_prefill_blocks
+        finally:
+            t.shutdown()
+
+    def test_disabled_queue_balancing(self):
+        t = self._make_balancing_tier(enable=False)
+        try:
+            t._stored_keys = {_to_key(i) for i in range(4)}
+            self._fill_load_queue(t, 20)
+
+            keys = [_to_key(i) for i in range(4)]
+            ctx = ReqContext(req_id="bal-4")
+            results = list(t._lookup_manager.batch_lookup(keys, ctx))
+
+            assert results == [True, True, True, True]
+        finally:
+            t.shutdown()
+
+    def test_no_balancing_when_no_stored_blocks(self):
+        t = self._make_balancing_tier(enable=True)
+        try:
+            self._fill_load_queue(t, 20)
+
+            keys = [_to_key(i) for i in range(4)]
+            ctx = ReqContext(req_id="bal-5")
+            results = list(t._lookup_manager.batch_lookup(keys, ctx))
+
+            assert results == [False, False, False, False]
+            assert t._prefill_queue_blocks == 0
         finally:
             t.shutdown()
 
