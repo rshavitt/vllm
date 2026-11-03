@@ -66,7 +66,8 @@ class SimAsyncLookupManager(AsyncLookupManager):
                 prefill_len = self._tier._prefill_queue_blocks
                 request_blocks = len(keys)
 
-                if prefill_len + request_blocks < load_queue_len:
+                prefill_target = load_queue_len * self._tier._prefill_ratio
+                if prefill_len + request_blocks < prefill_target:
                     self._tier._prefill_queue_blocks += request_blocks
                     self._tier._req_prefill_blocks[req_context.req_id] = request_blocks
                     logger.info(
@@ -106,6 +107,7 @@ class SimulatedTierManager(SecondaryTierManager):
         n_read_threads: int = 16,
         n_write_threads: int = 16,
         enable_queue_balancing: bool = True,
+        prefill_ratio: float = 1.0,
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -126,6 +128,7 @@ class SimulatedTierManager(SecondaryTierManager):
         self._stored_keys_lock = threading.Lock()
 
         self._enable_queue_balancing = enable_queue_balancing
+        self._prefill_ratio = prefill_ratio
         self._prefill_queue_blocks: int = 0
         self._req_prefill_blocks: dict[str, int] = {}
 
@@ -145,7 +148,7 @@ class SimulatedTierManager(SecondaryTierManager):
             "SimulatedTierManager initialized: lookup=%.1fms, "
             "read_bw=%.1f MB/s, write_bw=%.1f MB/s, "
             "read_overhead=%.1fms, write_overhead=%.1fms, "
-            "threads=%d+%d, queue_balancing=%s",
+            "threads=%d+%d, queue_balancing=%s, prefill_ratio=%.2f",
             lookup_delay_ms,
             read_bandwidth_mb_s,
             write_bandwidth_mb_s,
@@ -154,6 +157,7 @@ class SimulatedTierManager(SecondaryTierManager):
             n_read_threads,
             n_write_threads,
             enable_queue_balancing,
+            prefill_ratio,
         )
 
     @override
