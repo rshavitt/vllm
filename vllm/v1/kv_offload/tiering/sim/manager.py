@@ -60,16 +60,20 @@ class SimAsyncLookupManager(AsyncLookupManager):
         with self._tier._stored_keys_lock:
             hits = [key in self._tier._stored_keys for key in keys]
             stored_count = sum(hits)
+            request_blocks = len(keys)
+
+            self._tier._total_lookup_blocks += request_blocks
+            self._tier._storage_hit_blocks += stored_count
 
             if self._tier._enable_queue_balancing and stored_count > 0:
                 load_queue_len = len(self._tier._pool._load_q)
                 prefill_len = self._tier._prefill_queue_blocks
-                request_blocks = len(keys)
 
                 prefill_target = load_queue_len * self._tier._prefill_ratio
                 if prefill_len + request_blocks < prefill_target:
                     self._tier._prefill_queue_blocks += request_blocks
                     self._tier._req_prefill_blocks[req_context.req_id] = request_blocks
+                    self._tier._forced_prefill_blocks += request_blocks
                     logger.info(
                         "Queue balancing: forcing prefill for req %s "
                         "(%d blocks). prefill_q=%d, load_q=%d",
@@ -131,6 +135,10 @@ class SimulatedTierManager(SecondaryTierManager):
         self._prefill_ratio = prefill_ratio
         self._prefill_queue_blocks: int = 0
         self._req_prefill_blocks: dict[str, int] = {}
+
+        self._total_lookup_blocks: int = 0
+        self._storage_hit_blocks: int = 0
+        self._forced_prefill_blocks: int = 0
 
         self._pool = DualQueueThreadPool(
             n_read_threads,
@@ -255,5 +263,23 @@ class SimulatedTierManager(SecondaryTierManager):
 
     @override
     def shutdown(self) -> None:
+        total = self._total_lookup_blocks
+        hits = self._storage_hit_blocks
+        prefill = self._forced_prefill_blocks
+        if total > 0:
+            hit_pct = 100.0 * hits / total
+            prefill_pct = 100.0 * prefill / total
+        else:
+            hit_pct = prefill_pct = 0.0
+        logger.info(
+            "SimulatedTierManager stats: "
+            "total_lookups=%d, storage_hits=%d (%.1f%%), "
+            "forced_prefill=%d (%.1f%%)",
+            total,
+            hits,
+            hit_pct,
+            prefill,
+            prefill_pct,
+        )
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)
