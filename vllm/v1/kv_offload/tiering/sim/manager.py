@@ -64,6 +64,24 @@ class SimAsyncLookupManager(AsyncLookupManager):
 
             self._tier._total_lookup_blocks += request_blocks
             self._tier._storage_hit_blocks += stored_count
+            self._tier._lookup_call_count += 1
+
+            if self._tier._lookup_call_count % self._tier._stats_log_interval == 0:
+                s_total = self._tier._total_lookup_blocks
+                s_hits = self._tier._storage_hit_blocks
+                s_prefill = self._tier._forced_prefill_blocks
+                s_hit_pct = 100.0 * s_hits / s_total if s_total else 0.0
+                s_pfx_pct = 100.0 * s_prefill / s_total if s_total else 0.0
+                logger.info(
+                    "SimulatedTierManager stats: "
+                    "total_lookups=%d, storage_hits=%d (%.1f%%), "
+                    "forced_prefill=%d (%.1f%%)",
+                    s_total,
+                    s_hits,
+                    s_hit_pct,
+                    s_prefill,
+                    s_pfx_pct,
+                )
 
             if self._tier._enable_queue_balancing and stored_count > 0:
                 load_queue_len = len(self._tier._pool._load_q)
@@ -73,7 +91,7 @@ class SimAsyncLookupManager(AsyncLookupManager):
                 if prefill_len + request_blocks < prefill_target:
                     self._tier._prefill_queue_blocks += request_blocks
                     self._tier._req_prefill_blocks[req_context.req_id] = request_blocks
-                    self._tier._forced_prefill_blocks += request_blocks
+                    self._tier._forced_prefill_blocks += stored_count
                     logger.info(
                         "Queue balancing: forcing prefill for req %s "
                         "(%d blocks). prefill_q=%d, load_q=%d",
@@ -139,6 +157,8 @@ class SimulatedTierManager(SecondaryTierManager):
         self._total_lookup_blocks: int = 0
         self._storage_hit_blocks: int = 0
         self._forced_prefill_blocks: int = 0
+        self._lookup_call_count: int = 0
+        self._stats_log_interval: int = 100
 
         self._pool = DualQueueThreadPool(
             n_read_threads,
