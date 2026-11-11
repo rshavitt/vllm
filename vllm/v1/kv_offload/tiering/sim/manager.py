@@ -85,13 +85,22 @@ class SimAsyncLookupManager(AsyncLookupManager):
 
             if self._tier._enable_queue_balancing and stored_count > 0:
                 load_queue_len = len(self._tier._pool._load_q)
-                prefill_len = self._tier._prefill_queue_blocks
+                # Only count prefill blocks from requests that have
+                # no pending loads — blocked requests can't prefill.
+                prefill_len = sum(
+                    blks
+                    for rid, blks in self._tier._req_prefill_blocks.items()
+                    if rid not in self._tier._reqs_with_pending_loads
+                )
 
                 prefill_target = load_queue_len * self._tier._prefill_ratio
                 if prefill_len + request_blocks < prefill_target:
                     self._tier._prefill_queue_blocks += request_blocks
-                    self._tier._req_prefill_blocks[req_context.req_id] = request_blocks
-                    self._tier._forced_prefill_blocks += request_blocks
+                    self._tier._req_prefill_blocks[req_context.req_id] = (
+                        self._tier._req_prefill_blocks.get(req_context.req_id, 0)
+                        + request_blocks
+                    )
+                    self._tier._forced_prefill_blocks += stored_count
                     logger.info(
                         "Queue balancing: forcing prefill for req %s "
                         "(%d blocks). prefill_q=%d, load_q=%d",
@@ -153,6 +162,9 @@ class SimulatedTierManager(SecondaryTierManager):
         self._prefill_ratio = prefill_ratio
         self._prefill_queue_blocks: int = 0
         self._req_prefill_blocks: dict[str, int] = {}
+        self._reqs_with_pending_loads: set[str] = set()
+        self._load_job_req: dict[int, str] = {}
+        self._req_pending_load_jobs: dict[str, int] = {}
 
         self._total_lookup_blocks: int = 0
         self._storage_hit_blocks: int = 0
@@ -222,6 +234,12 @@ class SimulatedTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        req_id = job_metadata.req_context.req_id
+        self._load_job_req[job_metadata.job_id] = req_id
+        self._req_pending_load_jobs[req_id] = (
+            self._req_pending_load_jobs.get(req_id, 0) + 1
+        )
+        self._reqs_with_pending_loads.add(req_id)
         if self._read_overhead_s > 0:
             self._read_limiter.reserve_overhead(self._read_overhead_s)
         tasks = (
@@ -241,9 +259,6 @@ class SimulatedTierManager(SecondaryTierManager):
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
-        """
-        Collect completed jobs from the finished-jobs queue.
-        """
         results = []
         for job_id, success in self._pool.get_finished():
             if self.events is not None:
@@ -257,6 +272,14 @@ class SimulatedTierManager(SecondaryTierManager):
                             locality=self.locality,
                         )
                     )
+            req_id = self._load_job_req.pop(job_id, None)
+            if req_id is not None:
+                remaining = self._req_pending_load_jobs.get(req_id, 1) - 1
+                if remaining <= 0:
+                    self._req_pending_load_jobs.pop(req_id, None)
+                    self._reqs_with_pending_loads.discard(req_id)
+                else:
+                    self._req_pending_load_jobs[req_id] = remaining
             results.append(JobResult(job_id=job_id, success=success))
         return results
 
@@ -272,6 +295,8 @@ class SimulatedTierManager(SecondaryTierManager):
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
+        self._reqs_with_pending_loads.discard(req_context.req_id)
+        self._req_pending_load_jobs.pop(req_context.req_id, None)
         with self._stored_keys_lock:
             prefill_blocks = self._req_prefill_blocks.pop(req_context.req_id, 0)
             if prefill_blocks:
