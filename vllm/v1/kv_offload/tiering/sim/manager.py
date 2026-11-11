@@ -85,13 +85,22 @@ class SimAsyncLookupManager(AsyncLookupManager):
 
             if self._tier._enable_queue_balancing and stored_count > 0:
                 load_queue_len = len(self._tier._pool._load_q)
-                prefill_len = self._tier._prefill_queue_blocks
+                # Only count prefill blocks from requests that have
+                # no pending loads — blocked requests can't prefill.
+                prefill_len = sum(
+                    blks
+                    for rid, blks in self._tier._req_prefill_blocks.items()
+                    if rid not in self._tier._reqs_with_pending_loads
+                )
 
                 prefill_target = load_queue_len * self._tier._prefill_ratio
                 if prefill_len + request_blocks < prefill_target:
                     self._tier._prefill_queue_blocks += request_blocks
-                    self._tier._req_prefill_blocks[req_context.req_id] = request_blocks
-                    self._tier._forced_prefill_blocks += request_blocks
+                    self._tier._req_prefill_blocks[req_context.req_id] = (
+                        self._tier._req_prefill_blocks.get(req_context.req_id, 0)
+                        + request_blocks
+                    )
+                    self._tier._forced_prefill_blocks += stored_count
                     logger.info(
                         "Queue balancing: forcing prefill for req %s "
                         "(%d blocks). prefill_q=%d, load_q=%d",
@@ -153,6 +162,7 @@ class SimulatedTierManager(SecondaryTierManager):
         self._prefill_ratio = prefill_ratio
         self._prefill_queue_blocks: int = 0
         self._req_prefill_blocks: dict[str, int] = {}
+        self._reqs_with_pending_loads: frozenset[str] = frozenset()
 
         self._total_lookup_blocks: int = 0
         self._storage_hit_blocks: int = 0
@@ -279,6 +289,7 @@ class SimulatedTierManager(SecondaryTierManager):
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
+        self._reqs_with_pending_loads = context.reqs_with_pending_promotions
         self._lookup_manager.flush()
 
     @override

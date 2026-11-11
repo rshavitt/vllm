@@ -81,6 +81,8 @@ class ScheduleEndContext(NamedTuple):
     new_req_ids: Collection[str]
     # Request IDs preempted this step.
     preempted_req_ids: Collection[str]
+    # Request IDs with in-flight secondary→primary promotions.
+    reqs_with_pending_promotions: frozenset[str] = frozenset()
 
 
 class LoadStoreSpec:

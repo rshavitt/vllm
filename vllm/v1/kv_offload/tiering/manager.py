@@ -752,8 +752,19 @@ class TieringOffloadingManager(OffloadingManager):
         self._processed_jobs_this_step = False
 
         self._flush_pending_promotions()
+
+        reqs_with_promotions = frozenset(
+            meta.req_context.req_id
+            for meta in self._transfer_jobs.values()
+            if meta.is_promotion
+        )
+        tier_context = ScheduleEndContext(
+            new_req_ids=context.new_req_ids,
+            preempted_req_ids=context.preempted_req_ids,
+            reqs_with_pending_promotions=reqs_with_promotions,
+        )
         for tier in self.secondary_tiers:
-            tier.on_schedule_end(context)
+            tier.on_schedule_end(tier_context)
 
         for req_id in context.new_req_ids:
             state = self._req_state.get(req_id)
