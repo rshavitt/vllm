@@ -75,12 +75,14 @@ class SimAsyncLookupManager(AsyncLookupManager):
                 logger.info(
                     "SimulatedTierManager stats: "
                     "total_lookups=%d, storage_hits=%d (%.1f%%), "
-                    "forced_prefill=%d (%.1f%%)",
+                    "forced_prefill=%d (%.1f%%), "
+                    "prefill_ratio=%.2f",
                     s_total,
                     s_hits,
                     s_hit_pct,
                     s_prefill,
                     s_pfx_pct,
+                    self._tier._prefill_ratio,
                 )
 
             if self._tier._enable_queue_balancing and stored_count > 0:
@@ -109,8 +111,10 @@ class SimAsyncLookupManager(AsyncLookupManager):
                         prefill_len + request_blocks,
                         load_queue_len,
                     )
+                    self._tier._window_prefill_blocks += request_blocks
                     return [False] * request_blocks
 
+            self._tier._window_prefill_blocks += request_blocks - stored_count
             return hits
 
 
@@ -138,7 +142,8 @@ class SimulatedTierManager(SecondaryTierManager):
         n_read_threads: int = 16,
         n_write_threads: int = 16,
         enable_queue_balancing: bool = True,
-        prefill_ratio: float = 1.0,
+        ratio_update_interval_s: float = 5.0,
+        ratio_ema_alpha: float = 0.3,
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -159,12 +164,19 @@ class SimulatedTierManager(SecondaryTierManager):
         self._stored_keys_lock = threading.Lock()
 
         self._enable_queue_balancing = enable_queue_balancing
-        self._prefill_ratio = prefill_ratio
+        self._prefill_ratio: float = 0.0
+        self._ratio_update_interval_s = ratio_update_interval_s
+        self._ratio_ema_alpha = ratio_ema_alpha
         self._prefill_queue_blocks: int = 0
         self._req_prefill_blocks: dict[str, int] = {}
         self._reqs_with_pending_loads: set[str] = set()
         self._load_job_req: dict[int, str] = {}
         self._req_pending_load_jobs: dict[str, int] = {}
+        self._load_job_block_count: dict[int, int] = {}
+
+        self._window_start: float = time.monotonic()
+        self._window_prefill_blocks: int = 0
+        self._window_load_blocks: int = 0
 
         self._total_lookup_blocks: int = 0
         self._storage_hit_blocks: int = 0
@@ -188,7 +200,8 @@ class SimulatedTierManager(SecondaryTierManager):
             "SimulatedTierManager initialized: lookup=%.1fms, "
             "read_bw=%.1f MB/s, write_bw=%.1f MB/s, "
             "read_overhead=%.1fms, write_overhead=%.1fms, "
-            "threads=%d+%d, queue_balancing=%s, prefill_ratio=%.2f",
+            "threads=%d+%d, queue_balancing=%s, "
+            "ratio_update_interval=%.1fs, ratio_ema_alpha=%.2f",
             lookup_delay_ms,
             read_bandwidth_mb_s,
             write_bandwidth_mb_s,
@@ -197,7 +210,8 @@ class SimulatedTierManager(SecondaryTierManager):
             n_read_threads,
             n_write_threads,
             enable_queue_balancing,
-            prefill_ratio,
+            ratio_update_interval_s,
+            ratio_ema_alpha,
         )
 
     @override
@@ -236,6 +250,7 @@ class SimulatedTierManager(SecondaryTierManager):
     def submit_load(self, job_metadata: JobMetadata) -> None:
         req_id = job_metadata.req_context.req_id
         self._load_job_req[job_metadata.job_id] = req_id
+        self._load_job_block_count[job_metadata.job_id] = len(job_metadata.keys)
         self._req_pending_load_jobs[req_id] = (
             self._req_pending_load_jobs.get(req_id, 0) + 1
         )
@@ -273,7 +288,10 @@ class SimulatedTierManager(SecondaryTierManager):
                         )
                     )
             req_id = self._load_job_req.pop(job_id, None)
+            block_count = self._load_job_block_count.pop(job_id, 0)
             if req_id is not None:
+                if block_count > 0 and success:
+                    self._window_load_blocks += block_count
                 remaining = self._req_pending_load_jobs.get(req_id, 1) - 1
                 if remaining <= 0:
                     self._req_pending_load_jobs.pop(req_id, None)
@@ -281,6 +299,8 @@ class SimulatedTierManager(SecondaryTierManager):
                 else:
                     self._req_pending_load_jobs[req_id] = remaining
             results.append(JobResult(job_id=job_id, success=success))
+        if self._enable_queue_balancing:
+            self._maybe_update_ratio()
         return results
 
     @override
@@ -292,6 +312,34 @@ class SimulatedTierManager(SecondaryTierManager):
     @override
     def drain_jobs(self) -> None:
         self._pool.wait_idle()
+
+    def _maybe_update_ratio(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._window_start
+        if elapsed < self._ratio_update_interval_s:
+            return
+
+        prefill_tp = self._window_prefill_blocks / elapsed
+        load_tp = self._window_load_blocks / elapsed
+
+        if load_tp > 0:
+            raw_ratio = prefill_tp / load_tp
+            alpha = self._ratio_ema_alpha
+            old = self._prefill_ratio
+            self._prefill_ratio = alpha * raw_ratio + (1 - alpha) * old
+            logger.info(
+                "Adaptive ratio: %.2f -> %.2f "
+                "(prefill=%.1f blk/s, load=%.1f blk/s, raw=%.2f)",
+                old,
+                self._prefill_ratio,
+                prefill_tp,
+                load_tp,
+                raw_ratio,
+            )
+
+        self._window_prefill_blocks = 0
+        self._window_load_blocks = 0
+        self._window_start = now
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
@@ -319,12 +367,14 @@ class SimulatedTierManager(SecondaryTierManager):
         logger.info(
             "SimulatedTierManager stats: "
             "total_lookups=%d, storage_hits=%d (%.1f%%), "
-            "forced_prefill=%d (%.1f%%)",
+            "forced_prefill=%d (%.1f%%), "
+            "final_prefill_ratio=%.2f",
             total,
             hits,
             hit_pct,
             prefill,
             prefill_pct,
+            self._prefill_ratio,
         )
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)

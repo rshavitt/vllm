@@ -267,15 +267,16 @@ class TestQueueBalancing:
     def _make_balancing_tier(
         self, enable: bool = True, prefill_ratio: float = 1.0
     ) -> SimulatedTierManager:
-        return SimulatedTierManager(
+        t = SimulatedTierManager(
             offloading_spec=_MOCK_SPEC,
             primary_kv_view=_make_primary_view(),
             tier_type="sim",
             n_read_threads=2,
             n_write_threads=2,
             enable_queue_balancing=enable,
-            prefill_ratio=prefill_ratio,
         )
+        t._prefill_ratio = prefill_ratio
+        return t
 
     def _fill_load_queue(self, tier: SimulatedTierManager, count: int):
         """Add no-op tasks to the load queue to simulate backlog."""
@@ -396,6 +397,156 @@ class TestQueueBalancing:
             r2 = list(t._lookup_manager.batch_lookup(keys2, ReqContext(req_id="r2")))
             assert r2 == [False, False, False, False]
             assert t._prefill_queue_blocks == 8
+        finally:
+            t.shutdown()
+
+
+class TestAdaptiveRatio:
+    def _make_adaptive_tier(
+        self,
+        ratio_update_interval_s: float = 0.0,
+        ratio_ema_alpha: float = 1.0,
+    ) -> SimulatedTierManager:
+        return SimulatedTierManager(
+            offloading_spec=_MOCK_SPEC,
+            primary_kv_view=_make_primary_view(),
+            tier_type="sim",
+            n_read_threads=2,
+            n_write_threads=2,
+            enable_queue_balancing=True,
+            ratio_update_interval_s=ratio_update_interval_s,
+            ratio_ema_alpha=ratio_ema_alpha,
+        )
+
+    def test_ratio_increases_when_prefill_faster(self):
+        t = self._make_adaptive_tier()
+        try:
+            t._window_prefill_blocks = 100
+            t._window_load_blocks = 20
+            t._window_start = time.monotonic() - 1.0
+            t._maybe_update_ratio()
+            assert t._prefill_ratio == pytest.approx(5.0)
+        finally:
+            t.shutdown()
+
+    def test_ratio_decreases_when_load_faster(self):
+        t = self._make_adaptive_tier()
+        try:
+            t._window_prefill_blocks = 10
+            t._window_load_blocks = 50
+            t._window_start = time.monotonic() - 1.0
+            t._maybe_update_ratio()
+            assert t._prefill_ratio == pytest.approx(0.2)
+        finally:
+            t.shutdown()
+
+    def test_ratio_non_negative(self):
+        t = self._make_adaptive_tier()
+        try:
+            t._window_prefill_blocks = 0
+            t._window_load_blocks = 100
+            t._window_start = time.monotonic() - 1.0
+            t._maybe_update_ratio()
+            assert t._prefill_ratio >= 0.0
+            assert t._prefill_ratio == pytest.approx(0.0)
+        finally:
+            t.shutdown()
+
+    def test_ratio_unchanged_when_no_loads(self):
+        t = self._make_adaptive_tier()
+        try:
+            initial = t._prefill_ratio
+            t._window_prefill_blocks = 50
+            t._window_load_blocks = 0
+            t._window_start = time.monotonic() - 1.0
+            t._maybe_update_ratio()
+            assert t._prefill_ratio == initial
+        finally:
+            t.shutdown()
+
+    def test_ema_smoothing(self):
+        alpha = 0.3
+        t = self._make_adaptive_tier(ratio_ema_alpha=alpha)
+        try:
+            t._prefill_ratio = 2.0
+            t._window_prefill_blocks = 80
+            t._window_load_blocks = 20
+            t._window_start = time.monotonic() - 1.0
+            t._maybe_update_ratio()
+            # raw_ratio = 80/20 = 4.0
+            # new = 0.3 * 4.0 + 0.7 * 2.0 = 1.2 + 1.4 = 2.6
+            assert t._prefill_ratio == pytest.approx(2.6)
+        finally:
+            t.shutdown()
+
+    def test_window_counters_reset_after_update(self):
+        t = self._make_adaptive_tier()
+        try:
+            t._window_prefill_blocks = 50
+            t._window_load_blocks = 25
+            t._window_start = time.monotonic() - 1.0
+            t._maybe_update_ratio()
+            assert t._window_prefill_blocks == 0
+            assert t._window_load_blocks == 0
+        finally:
+            t.shutdown()
+
+    def test_window_counters_reset_even_when_no_loads(self):
+        t = self._make_adaptive_tier()
+        try:
+            t._window_prefill_blocks = 50
+            t._window_load_blocks = 0
+            t._window_start = time.monotonic() - 1.0
+            t._maybe_update_ratio()
+            assert t._window_prefill_blocks == 0
+            assert t._window_load_blocks == 0
+        finally:
+            t.shutdown()
+
+    def test_ratio_not_updated_when_balancing_disabled(self):
+        t = SimulatedTierManager(
+            offloading_spec=_MOCK_SPEC,
+            primary_kv_view=_make_primary_view(),
+            tier_type="sim",
+            n_read_threads=2,
+            n_write_threads=2,
+            enable_queue_balancing=False,
+        )
+        try:
+            initial = t._prefill_ratio
+            t._window_prefill_blocks = 100
+            t._window_load_blocks = 10
+            t._window_start = time.monotonic() - 10.0
+            # get_finished_jobs only calls _maybe_update_ratio when
+            # queue balancing is enabled
+            list(t.get_finished_jobs())
+            assert t._prefill_ratio == initial
+        finally:
+            t.shutdown()
+
+    def test_no_update_before_interval(self):
+        t = self._make_adaptive_tier(ratio_update_interval_s=10.0)
+        try:
+            initial = t._prefill_ratio
+            t._window_prefill_blocks = 100
+            t._window_load_blocks = 10
+            t._maybe_update_ratio()
+            assert t._prefill_ratio == initial
+        finally:
+            t.shutdown()
+
+    def test_load_blocks_counted_from_finished_jobs(self):
+        t = self._make_adaptive_tier(ratio_update_interval_s=999.0)
+        try:
+            t.submit_store(_make_job(0, [0, 1, 2]))
+            t.drain_jobs()
+            list(t.get_finished_jobs())
+
+            t.submit_load(_make_job(10, [0, 1, 2]))
+            t.drain_jobs()
+            list(t.get_finished_jobs())
+
+            assert t._window_load_blocks == 3
         finally:
             t.shutdown()
 
