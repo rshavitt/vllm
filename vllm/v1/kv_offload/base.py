@@ -81,6 +81,8 @@ class ScheduleEndContext(NamedTuple):
     new_req_ids: Collection[str]
     # Request IDs preempted this step.
     preempted_req_ids: Collection[str]
+    # Number of prefill tokens computed in this step.
+    num_prefill_tokens: int = 0
 
 
 class LoadStoreSpec:

@@ -1123,9 +1123,17 @@ class OffloadingConnectorScheduler:
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         self._update_req_states(scheduler_output)
+        num_prefill_tokens = 0
+        for req_id, n_tokens in scheduler_output.num_scheduled_tokens.items():
+            req_status = self._req_status.get(req_id)
+            if req_status is not None:
+                req = req_status.req
+                if req.num_computed_tokens < req.num_prompt_tokens:
+                    num_prefill_tokens += n_tokens
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
+            num_prefill_tokens=num_prefill_tokens,
         )
         self.manager.on_schedule_end(schedule_end_context)
 

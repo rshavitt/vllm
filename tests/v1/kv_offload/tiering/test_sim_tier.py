@@ -29,6 +29,7 @@ from vllm.v1.kv_offload.tiering.sim.manager import SimulatedTierManager
 
 _CTX = ReqContext(req_id="test-sim")
 _MOCK_SPEC = MagicMock()
+_MOCK_SPEC.tokens_per_block = (16,)
 _NUM_BLOCKS = 8
 _BLOCK_BYTES = 64
 
@@ -421,8 +422,8 @@ class TestAdaptiveRatio:
     def test_ratio_increases_when_prefill_faster(self):
         t = self._make_adaptive_tier()
         try:
-            t._window_prefill_blocks = 100
-            t._window_load_blocks = 20
+            t._window_prefill_tokens = 100
+            t._window_load_tokens = 20
             t._window_start = time.monotonic() - 1.0
             t._maybe_update_ratio()
             assert t._prefill_ratio == pytest.approx(5.0)
@@ -432,8 +433,8 @@ class TestAdaptiveRatio:
     def test_ratio_decreases_when_load_faster(self):
         t = self._make_adaptive_tier()
         try:
-            t._window_prefill_blocks = 10
-            t._window_load_blocks = 50
+            t._window_prefill_tokens = 10
+            t._window_load_tokens = 50
             t._window_start = time.monotonic() - 1.0
             t._maybe_update_ratio()
             assert t._prefill_ratio == pytest.approx(0.2)
@@ -443,8 +444,8 @@ class TestAdaptiveRatio:
     def test_ratio_non_negative(self):
         t = self._make_adaptive_tier()
         try:
-            t._window_prefill_blocks = 0
-            t._window_load_blocks = 100
+            t._window_prefill_tokens = 0
+            t._window_load_tokens = 100
             t._window_start = time.monotonic() - 1.0
             t._maybe_update_ratio()
             assert t._prefill_ratio >= 0.0
@@ -456,8 +457,8 @@ class TestAdaptiveRatio:
         t = self._make_adaptive_tier()
         try:
             initial = t._prefill_ratio
-            t._window_prefill_blocks = 50
-            t._window_load_blocks = 0
+            t._window_prefill_tokens = 50
+            t._window_load_tokens = 0
             t._window_start = time.monotonic() - 1.0
             t._maybe_update_ratio()
             assert t._prefill_ratio == initial
@@ -469,8 +470,8 @@ class TestAdaptiveRatio:
         t = self._make_adaptive_tier(ratio_ema_alpha=alpha)
         try:
             t._prefill_ratio = 2.0
-            t._window_prefill_blocks = 80
-            t._window_load_blocks = 20
+            t._window_prefill_tokens = 80
+            t._window_load_tokens = 20
             t._window_start = time.monotonic() - 1.0
             t._maybe_update_ratio()
             # raw_ratio = 80/20 = 4.0
@@ -482,24 +483,24 @@ class TestAdaptiveRatio:
     def test_window_counters_reset_after_update(self):
         t = self._make_adaptive_tier()
         try:
-            t._window_prefill_blocks = 50
-            t._window_load_blocks = 25
+            t._window_prefill_tokens = 50
+            t._window_load_tokens = 25
             t._window_start = time.monotonic() - 1.0
             t._maybe_update_ratio()
-            assert t._window_prefill_blocks == 0
-            assert t._window_load_blocks == 0
+            assert t._window_prefill_tokens == 0
+            assert t._window_load_tokens == 0
         finally:
             t.shutdown()
 
     def test_window_counters_reset_even_when_no_loads(self):
         t = self._make_adaptive_tier()
         try:
-            t._window_prefill_blocks = 50
-            t._window_load_blocks = 0
+            t._window_prefill_tokens = 50
+            t._window_load_tokens = 0
             t._window_start = time.monotonic() - 1.0
             t._maybe_update_ratio()
-            assert t._window_prefill_blocks == 0
-            assert t._window_load_blocks == 0
+            assert t._window_prefill_tokens == 0
+            assert t._window_load_tokens == 0
         finally:
             t.shutdown()
 
@@ -514,11 +515,9 @@ class TestAdaptiveRatio:
         )
         try:
             initial = t._prefill_ratio
-            t._window_prefill_blocks = 100
-            t._window_load_blocks = 10
+            t._window_prefill_tokens = 100
+            t._window_load_tokens = 10
             t._window_start = time.monotonic() - 10.0
-            # get_finished_jobs only calls _maybe_update_ratio when
-            # queue balancing is enabled
             list(t.get_finished_jobs())
             assert t._prefill_ratio == initial
         finally:
@@ -528,10 +527,23 @@ class TestAdaptiveRatio:
         t = self._make_adaptive_tier(ratio_update_interval_s=10.0)
         try:
             initial = t._prefill_ratio
-            t._window_prefill_blocks = 100
-            t._window_load_blocks = 10
+            t._window_prefill_tokens = 100
+            t._window_load_tokens = 10
             t._maybe_update_ratio()
             assert t._prefill_ratio == initial
+        finally:
+            t.shutdown()
+
+    def test_prefill_tokens_accumulated_from_schedule_end(self):
+        t = self._make_adaptive_tier(ratio_update_interval_s=999.0)
+        try:
+            ctx = ScheduleEndContext(
+                new_req_ids=[], preempted_req_ids=(), num_prefill_tokens=42
+            )
+            t.on_schedule_end(ctx)
+            assert t._window_prefill_tokens == 42
+            t.on_schedule_end(ctx)
+            assert t._window_prefill_tokens == 84
         finally:
             t.shutdown()
 
@@ -546,7 +558,7 @@ class TestAdaptiveRatio:
             t.drain_jobs()
             list(t.get_finished_jobs())
 
-            assert t._window_load_blocks == 3
+            assert t._window_load_tokens == 3 * 16
         finally:
             t.shutdown()
 

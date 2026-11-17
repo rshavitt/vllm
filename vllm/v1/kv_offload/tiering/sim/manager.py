@@ -111,10 +111,8 @@ class SimAsyncLookupManager(AsyncLookupManager):
                         prefill_len + request_blocks,
                         load_queue_len,
                     )
-                    self._tier._window_prefill_blocks += request_blocks
                     return [False] * request_blocks
 
-            self._tier._window_prefill_blocks += request_blocks - stored_count
             return hits
 
 
@@ -147,6 +145,7 @@ class SimulatedTierManager(SecondaryTierManager):
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
+        self._tokens_per_block: int = offloading_spec.tokens_per_block[0]
         self._lookup_delay_s = lookup_delay_ms / 1000.0
         self._read_overhead_s = read_overhead_ms / 1000.0
         self._write_overhead_s = write_overhead_ms / 1000.0
@@ -175,8 +174,8 @@ class SimulatedTierManager(SecondaryTierManager):
         self._load_job_block_count: dict[int, int] = {}
 
         self._window_start: float = time.monotonic()
-        self._window_prefill_blocks: int = 0
-        self._window_load_blocks: int = 0
+        self._window_prefill_tokens: int = 0
+        self._window_load_tokens: int = 0
 
         self._total_lookup_blocks: int = 0
         self._storage_hit_blocks: int = 0
@@ -291,7 +290,7 @@ class SimulatedTierManager(SecondaryTierManager):
             block_count = self._load_job_block_count.pop(job_id, 0)
             if req_id is not None:
                 if block_count > 0 and success:
-                    self._window_load_blocks += block_count
+                    self._window_load_tokens += block_count * self._tokens_per_block
                 remaining = self._req_pending_load_jobs.get(req_id, 1) - 1
                 if remaining <= 0:
                     self._req_pending_load_jobs.pop(req_id, None)
@@ -319,8 +318,8 @@ class SimulatedTierManager(SecondaryTierManager):
         if elapsed < self._ratio_update_interval_s:
             return
 
-        prefill_tp = self._window_prefill_blocks / elapsed
-        load_tp = self._window_load_blocks / elapsed
+        prefill_tp = self._window_prefill_tokens / elapsed
+        load_tp = self._window_load_tokens / elapsed
 
         if load_tp > 0:
             raw_ratio = prefill_tp / load_tp
@@ -329,7 +328,7 @@ class SimulatedTierManager(SecondaryTierManager):
             self._prefill_ratio = alpha * raw_ratio + (1 - alpha) * old
             logger.info(
                 "Adaptive ratio: %.2f -> %.2f "
-                "(prefill=%.1f blk/s, load=%.1f blk/s, raw=%.2f)",
+                "(prefill=%.1f tok/s, load=%.1f tok/s, raw=%.2f)",
                 old,
                 self._prefill_ratio,
                 prefill_tp,
@@ -337,8 +336,8 @@ class SimulatedTierManager(SecondaryTierManager):
                 raw_ratio,
             )
 
-        self._window_prefill_blocks = 0
-        self._window_load_blocks = 0
+        self._window_prefill_tokens = 0
+        self._window_load_tokens = 0
         self._window_start = now
 
     def on_request_finished(self, req_context: ReqContext) -> None:
@@ -352,6 +351,7 @@ class SimulatedTierManager(SecondaryTierManager):
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
+        self._window_prefill_tokens += context.num_prefill_tokens
         self._lookup_manager.flush()
 
     @override
