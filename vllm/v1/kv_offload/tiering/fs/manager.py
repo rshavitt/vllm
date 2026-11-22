@@ -18,6 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
+import threading
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
@@ -75,8 +76,63 @@ class FsAsyncLookupManager(AsyncLookupManager):
         paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
         if _HAS_BATCH_LOOKUP_C:
             # C extension: GIL released for the entire faccessat() batch.
-            return batch_lookup_C(paths)
-        return (os.path.exists(p) for p in paths)
+            hits = list(batch_lookup_C(paths))
+        else:
+            hits = [os.path.exists(p) for p in paths]
+
+        stored_count = sum(hits)
+        request_blocks = len(keys)
+
+        self._tier._total_lookup_blocks += request_blocks
+        self._tier._storage_hit_blocks += stored_count
+        self._tier._lookup_call_count += 1
+
+        if self._tier._lookup_call_count % self._tier._stats_log_interval == 0:
+            s_total = self._tier._total_lookup_blocks
+            s_hits = self._tier._storage_hit_blocks
+            s_prefill = self._tier._forced_prefill_blocks
+            s_hit_pct = 100.0 * s_hits / s_total if s_total else 0.0
+            s_pfx_pct = 100.0 * s_prefill / s_total if s_total else 0.0
+            logger.info(
+                "FileSystemTierManager stats: "
+                "total_lookups=%d, storage_hits=%d (%.1f%%), "
+                "forced_prefill=%d (%.1f%%)",
+                s_total,
+                s_hits,
+                s_hit_pct,
+                s_prefill,
+                s_pfx_pct,
+            )
+
+        if self._tier._enable_queue_balancing and stored_count > 0:
+            load_queue_len = len(self._tier._pool._load_q)
+            with self._tier._queue_balance_lock:
+                # Only count prefill blocks from requests that have
+                # no pending loads — blocked requests can't prefill.
+                prefill_len = sum(
+                    blks
+                    for rid, blks in self._tier._req_prefill_blocks.items()
+                    if rid not in self._tier._reqs_with_pending_loads
+                )
+                prefill_target = load_queue_len * self._tier._prefill_ratio
+                if prefill_len + request_blocks < prefill_target:
+                    self._tier._prefill_queue_blocks += request_blocks
+                    self._tier._req_prefill_blocks[req_context.req_id] = (
+                        self._tier._req_prefill_blocks.get(req_context.req_id, 0)
+                        + request_blocks
+                    )
+                    self._tier._forced_prefill_blocks += stored_count
+                    logger.info(
+                        "Queue balancing: forcing prefill for req %s "
+                        "(%d blocks). prefill_q=%d, load_q=%d",
+                        req_context.req_id,
+                        request_blocks,
+                        prefill_len + request_blocks,
+                        load_queue_len,
+                    )
+                    return [False] * request_blocks
+
+        return hits
 
 
 class FileSystemTierManager(SecondaryTierManager):
@@ -112,6 +168,8 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        enable_queue_balancing: bool = False,
+        prefill_ratio: float = 1.0,
     ):
         """
         Args:
@@ -127,6 +185,11 @@ class FileSystemTierManager(SecondaryTierManager):
                 cache events are enabled globally (kv_events_config).
             locality: Whether this tier's storage is LOCAL or REMOTE relative
                 to the publishing vLLM instance.
+            enable_queue_balancing: When True, batch_lookup may force MISS
+                for all blocks of a request to keep the prefill queue stocked
+                relative to the load queue.
+            prefill_ratio: Target ratio of prefill-queue blocks to load-queue
+                blocks. Used when enable_queue_balancing is True.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
@@ -168,6 +231,20 @@ class FileSystemTierManager(SecondaryTierManager):
                     self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
                 )
 
+        self._enable_queue_balancing = enable_queue_balancing
+        self._prefill_ratio: float = prefill_ratio
+        self._prefill_queue_blocks: int = 0
+        self._req_prefill_blocks: dict[str, int] = {}
+        self._reqs_with_pending_loads: set[str] = set()
+        self._load_job_req: dict[int, str] = {}
+        self._req_pending_load_jobs: dict[str, int] = {}
+        self._queue_balance_lock = threading.Lock()
+        self._total_lookup_blocks: int = 0
+        self._storage_hit_blocks: int = 0
+        self._forced_prefill_blocks: int = 0
+        self._lookup_call_count: int = 0
+        self._stats_log_interval: int = 100
+
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
@@ -205,6 +282,12 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        req_id = job_metadata.req_context.req_id
+        self._load_job_req[job_metadata.job_id] = req_id
+        self._req_pending_load_jobs[req_id] = (
+            self._req_pending_load_jobs.get(req_id, 0) + 1
+        )
+        self._reqs_with_pending_loads.add(req_id)
         tasks = (
             functools.partial(
                 load_block,
@@ -235,6 +318,14 @@ class FileSystemTierManager(SecondaryTierManager):
                             locality=self.locality,
                         )
                     )
+            req_id = self._load_job_req.pop(job_id, None)
+            if req_id is not None:
+                remaining = self._req_pending_load_jobs.get(req_id, 1) - 1
+                if remaining <= 0:
+                    self._req_pending_load_jobs.pop(req_id, None)
+                    self._reqs_with_pending_loads.discard(req_id)
+                else:
+                    self._req_pending_load_jobs[req_id] = remaining
             results.append(JobResult(job_id=job_id, success=success))
         return results
 
@@ -249,8 +340,15 @@ class FileSystemTierManager(SecondaryTierManager):
         """Block until all in-flight transfers in the threadpool finish."""
         self._pool.wait_idle()
 
+    @override
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
+        self._reqs_with_pending_loads.discard(req_context.req_id)
+        self._req_pending_load_jobs.pop(req_context.req_id, None)
+        with self._queue_balance_lock:
+            prefill_blocks = self._req_prefill_blocks.pop(req_context.req_id, 0)
+            if prefill_blocks:
+                self._prefill_queue_blocks -= prefill_blocks
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
@@ -264,5 +362,23 @@ class FileSystemTierManager(SecondaryTierManager):
         Shuts down the lookup manager and the thread pool,
         clearing pending tasks and waiting for active threads to complete.
         """
+        total = self._total_lookup_blocks
+        hits = self._storage_hit_blocks
+        prefill = self._forced_prefill_blocks
+        if total > 0:
+            hit_pct = 100.0 * hits / total
+            prefill_pct = 100.0 * prefill / total
+        else:
+            hit_pct = prefill_pct = 0.0
+        logger.info(
+            "FileSystemTierManager stats: "
+            "total_lookups=%d, storage_hits=%d (%.1f%%), "
+            "forced_prefill=%d (%.1f%%)",
+            total,
+            hits,
+            hit_pct,
+            prefill,
+            prefill_pct,
+        )
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)
