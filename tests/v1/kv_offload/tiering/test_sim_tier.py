@@ -12,6 +12,7 @@ Tests verify:
 6. Shutdown completes cleanly
 """
 
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -24,14 +25,14 @@ from vllm.v1.kv_offload.base import (
     ScheduleEndContext,
     make_offload_key,
 )
-from vllm.v1.kv_offload.tiering import queue_balance
 from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.fs.thread_pool import JobState
-from vllm.v1.kv_offload.tiering.queue_balance import WaitBalanceController
+from vllm.v1.kv_offload.tiering.queue_balance import CapacityRatioController
 from vllm.v1.kv_offload.tiering.sim.manager import SimulatedTierManager
 
 _CTX = ReqContext(req_id="test-sim")
 _MOCK_SPEC = MagicMock()
+_MOCK_SPEC.tokens_per_block = (16,)
 _NUM_BLOCKS = 8
 _BLOCK_BYTES = 64
 
@@ -404,82 +405,124 @@ class TestQueueBalancing:
             t.shutdown()
 
 
-class TestWaitBalanceController:
-    """The ratio must move toward equal per-block waits on both paths."""
-
-    @pytest.fixture
-    def clock(self, monkeypatch):
-        now = [1000.0]
-        monkeypatch.setattr(queue_balance.time, "monotonic", lambda: now[0])
-        return now
-
-    def _run_window(self, c, clock, load_wait_s=None, prefill_wait_s=None):
-        """Route one 10-block request per path, complete it after the given
-        wait, then advance past the update interval."""
-        if load_wait_s is not None:
-            c.on_routed("load", 10, forced_prefill=False)
-        if prefill_wait_s is not None:
-            c.on_routed("pf", 10, forced_prefill=True)
-        start = clock[0]
-        for req_id, wait in (("load", load_wait_s), ("pf", prefill_wait_s)):
-            if wait is not None:
-                clock[0] = start + wait
-                c.on_schedule_end([req_id])
-                c.on_schedule_end([])
-        clock[0] = start + 2.0
-        c.on_schedule_end([])
+class TestCapacityRatioController:
+    """ratio == prefill capacity / load capacity, sampled only while busy."""
 
     def _make(self, **kw):
-        kw.setdefault("update_interval_s", 1.0)
+        kw.setdefault("tokens_per_block", 16)
         kw.setdefault("ema_alpha", 1.0)
-        kw.setdefault("gain", 1.0)
-        kw.setdefault("max_step", 2.0)
-        return WaitBalanceController(**kw)
+        kw.setdefault("min_busy_s", 1.0)
+        kw.setdefault("init_ratio", 1.0)
+        return CapacityRatioController(**kw)
 
-    def test_ratio_grows_when_loads_wait_longer(self, clock):
+    def _prefill_steps(self, c, t0, n, tokens=200, dt=0.125, bound=True):
+        """n steps spaced dt apart (exact in binary, so busy time sums
+        exactly); 200 tok / 16 per block / 0.125 s = 100 blk/s."""
+        t = t0
+        for _ in range(n + 1):
+            c.on_schedule_end(t, tokens, bound, 0, 0.0)
+            t += dt
+        return t - dt
+
+    def test_ratio_is_capacity_quotient(self):
         c = self._make()
-        self._run_window(c, clock, load_wait_s=0.15, prefill_wait_s=0.1)
-        assert c.ratio == pytest.approx(1.5)
+        # prefill: 100 blk/s; load: 50 blk over 1 s.
+        t = self._prefill_steps(c, 0.0, 10)
+        c.on_schedule_end(t, 0, False, 50, 1.0)
+        assert c.ratio == pytest.approx(2.0)
 
-    def test_ratio_shrinks_when_prefills_wait_longer(self, clock):
+    def test_ratio_held_until_both_capacities_known(self):
+        c = self._make(init_ratio=3.0)
+        self._prefill_steps(c, 0.0, 10)
+        assert c.ratio == 3.0
+
+    def test_idle_load_queue_does_not_change_ratio(self):
+        """No busy samples (nothing routed to load) => estimate and ratio
+        stay put, however long the window."""
         c = self._make()
-        self._run_window(c, clock, load_wait_s=0.1, prefill_wait_s=0.15)
-        assert c.ratio == pytest.approx(1 / 1.5)
+        t = self._prefill_steps(c, 0.0, 10)
+        c.on_schedule_end(t, 0, False, 50, 1.0)
+        assert c.ratio == pytest.approx(2.0)
+        t = self._prefill_steps(c, t + 0.1, 100)
+        for _ in range(10):
+            c.on_schedule_end(t, 0, False, 0, 0.0)
+        assert c.ratio == pytest.approx(2.0)
 
-    def test_ratio_stable_when_waits_equal(self, clock):
-        c = self._make(init_ratio=7.0)
-        self._run_window(c, clock, load_wait_s=0.1, prefill_wait_s=0.1)
-        assert c.ratio == pytest.approx(7.0)
-
-    def test_step_is_clamped(self, clock):
-        c = self._make(max_step=1.5)
-        self._run_window(c, clock, load_wait_s=1.0, prefill_wait_s=0.01)
-        assert c.ratio == pytest.approx(1.5)
-
-    def test_probes_up_when_nothing_forced(self, clock):
-        """Regression for v4's collapse: with no forced prefills the ratio
-        must rise, not settle at a value that never forces anything."""
-        c = self._make(init_ratio=0.1)
-        self._run_window(c, clock, load_wait_s=0.1)
-        assert c.ratio == pytest.approx(0.2)
-
-    def test_unchanged_without_load_traffic(self, clock):
+    def test_steps_below_token_budget_are_not_capacity(self):
         c = self._make()
-        self._run_window(c, clock, prefill_wait_s=0.1)
+        c.on_schedule_end(0.0, 10, False, 50, 1.0)
+        self._prefill_steps(c, 0.1, 30, tokens=10, bound=False)
+        assert c.ratio == 1.0
+
+    def test_idle_gap_between_steps_is_ignored(self):
+        c = self._make()
+        c.on_schedule_end(0.0, 160, True, 50, 1.0)
+        c.on_schedule_end(0.1, 160, True, 0, 0.0)
+        c.on_schedule_end(30.0, 160, True, 0, 0.0)
+        assert c._prefill._busy_s == pytest.approx(0.1)
+
+    def test_ratio_follows_capacity_change(self):
+        c = self._make()
+        t = self._prefill_steps(c, 0.0, 10)
+        c.on_schedule_end(t, 0, False, 50, 1.0)
+        assert c.ratio == pytest.approx(2.0)
+        c.on_schedule_end(t, 0, False, 100, 1.0)
         assert c.ratio == pytest.approx(1.0)
 
-    def test_completion_timestamped_one_step_later(self, clock):
-        c = self._make(update_interval_s=1e9)
-        c.on_routed("r", 1, forced_prefill=False)
-        clock[0] += 0.1
-        c.on_schedule_end(["r"])
-        assert "r" in c._load.inflight
-        clock[0] += 0.05
-        c.on_schedule_end([])
-        assert "r" not in c._load.inflight
-        assert c._load.wait_sum == pytest.approx(0.15)
+    def test_ratio_clamped(self):
+        c = self._make()
+        t = self._prefill_steps(c, 0.0, 10)
+        c.on_schedule_end(t, 0, False, 1, 1.0)
+        assert c.ratio == pytest.approx(100.0)
 
-    def test_lookup_routes_forced_request_to_prefill_path(self):
+
+class TestLoadCapacityMeter:
+    def test_load_backlog_counts_queued_and_running(self):
+        from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+
+        pool = DualQueueThreadPool(1, 0)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def blocker():
+            started.set()
+            gate.wait(5)
+
+        try:
+            pool.enqueue_load(1, 3, [blocker, lambda: None, lambda: None])
+            assert started.wait(5)
+            assert pool.load_backlog() == 3
+            gate.set()
+            pool.wait_idle()
+            assert pool.load_backlog() == 0
+        finally:
+            gate.set()
+            pool.shutdown()
+
+    def test_sample_only_counts_saturated_time(self):
+        from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+
+        pool = DualQueueThreadPool(1, 0)
+        try:
+            pool.enqueue_load(1, 1, [lambda: time.sleep(0.05)])
+            pool.wait_idle()
+            time.sleep(0.2)
+            blocks, busy_s = pool.pop_load_capacity_sample()
+            assert blocks == 0
+            assert busy_s < 0.15
+
+            n = 10
+            pool.enqueue_load(2, n, [lambda: time.sleep(0.02)] * n)
+            pool.wait_idle()
+            blocks, busy_s = pool.pop_load_capacity_sample()
+            assert blocks >= n - 2
+            assert 0.1 < busy_s < 0.3
+        finally:
+            pool.shutdown()
+
+
+class TestPrefillBacklog:
+    def _tier(self):
         t = SimulatedTierManager(
             offloading_spec=_MOCK_SPEC,
             primary_kv_view=_make_primary_view(),
@@ -488,16 +531,50 @@ class TestWaitBalanceController:
             n_write_threads=2,
             enable_queue_balancing=True,
         )
+        t._stored_keys = {_to_key(i) for i in range(4)}
+        return t
+
+    def test_backlog_shrinks_as_blocks_are_prefilled(self):
+        t = self._tier()
         try:
-            t._stored_keys = {_to_key(i) for i in range(4)}
-            keys = [_to_key(i) for i in range(4)]
-            list(t._lookup_manager.batch_lookup(keys, ReqContext(req_id="hit")))
             with t._pool._condition:
                 for _ in range(20):
                     t._pool._load_q.append((lambda: None, JobState(-1, 1)))
-            list(t._lookup_manager.batch_lookup(keys, ReqContext(req_id="forced")))
-            assert "hit" in t._ratio_controller._load.inflight
-            assert "forced" in t._ratio_controller._prefill.inflight
+            keys = [_to_key(i) for i in range(4)]
+            list(t._lookup_manager.batch_lookup(keys, ReqContext(req_id="r")))
+            assert t._req_prefill_blocks["r"] == 4
+            # 16 tokens/block: 40 tokens -> 3 blocks, then clamp at 0.
+            t.on_schedule_end(
+                ScheduleEndContext(
+                    new_req_ids=[],
+                    preempted_req_ids=(),
+                    prefill_tokens_by_req={"r": 40},
+                )
+            )
+            assert t._req_prefill_blocks["r"] == 1
+            assert t._prefill_queue_blocks == 1
+            t.on_schedule_end(
+                ScheduleEndContext(
+                    new_req_ids=[],
+                    preempted_req_ids=(),
+                    prefill_tokens_by_req={"r": 400},
+                )
+            )
+            assert t._req_prefill_blocks["r"] == 0
+            assert t._prefill_queue_blocks == 0
+        finally:
+            t.shutdown()
+
+    def test_running_loads_count_as_load_backlog(self):
+        """With work in flight on the load path (nothing queued), a request
+        is still diverted to prefill when the prefill backlog is small."""
+        t = self._tier()
+        try:
+            t._ratio_controller.ratio = 10.0
+            t._pool._load_active = 2
+            keys = [_to_key(i) for i in range(4)]
+            res = list(t._lookup_manager.batch_lookup(keys, ReqContext(req_id="x")))
+            assert res == [False] * 4
         finally:
             t.shutdown()
 

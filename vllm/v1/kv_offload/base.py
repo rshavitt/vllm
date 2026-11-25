@@ -5,9 +5,10 @@ Core abstractions for KV cache offloading in vLLM v1.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, NewType
 
 import numpy as np
@@ -81,8 +82,10 @@ class ScheduleEndContext(NamedTuple):
     new_req_ids: Collection[str]
     # Request IDs preempted this step.
     preempted_req_ids: Collection[str]
-    # Request IDs whose prefill completes with this step.
-    prefill_done_req_ids: Collection[str] = ()
+    # Prompt tokens scheduled this step, by request ID (prefill requests only).
+    prefill_tokens_by_req: Mapping[str, int] = MappingProxyType({})
+    # Whether this step filled the scheduler's token budget.
+    is_compute_bound: bool = False
 
 
 class LoadStoreSpec:

@@ -9,6 +9,7 @@ Thread pool:
 """
 
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
 
@@ -70,6 +71,14 @@ class DualQueueThreadPool:
         self._finished_q: deque[tuple[JobId, bool]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
 
+        # Load capacity metering, all guarded by _condition. The load path is
+        # "saturated" while tasks wait in _load_q (every thread is busy), so
+        # completions during that time measure its drain rate, not demand.
+        self._load_active = 0
+        self._load_sat_since: float | None = None
+        self._load_sat_s = 0.0
+        self._load_sat_blocks = 0
+
         for i in range(n_read_threads):
             t = threading.Thread(
                 target=self._worker,
@@ -102,6 +111,7 @@ class DualQueueThreadPool:
             self._inflight_jobs += 1
             for fn in tasks:
                 self._load_q.append((fn, state))
+            self._track_load_saturation(time.monotonic())
             self._condition.notify(n_tasks)
 
     def enqueue_store(
@@ -117,6 +127,30 @@ class DualQueueThreadPool:
             for fn in tasks:
                 self._store_q.append((fn, state))
             self._condition.notify(n_tasks)
+
+    def load_backlog(self) -> int:
+        """Load tasks queued or running (remaining load work, in blocks)."""
+        return len(self._load_q) + self._load_active
+
+    def pop_load_capacity_sample(self) -> tuple[int, float]:
+        """Return and reset (blocks completed, seconds) while load-saturated."""
+        with self._condition:
+            now = time.monotonic()
+            if self._load_sat_since is not None:
+                self._load_sat_s += now - self._load_sat_since
+                self._load_sat_since = now
+            sample = (self._load_sat_blocks, self._load_sat_s)
+            self._load_sat_blocks = 0
+            self._load_sat_s = 0.0
+            return sample
+
+    def _track_load_saturation(self, now: float) -> None:
+        saturated = len(self._load_q) > 0
+        if saturated and self._load_sat_since is None:
+            self._load_sat_since = now
+        elif not saturated and self._load_sat_since is not None:
+            self._load_sat_s += now - self._load_sat_since
+            self._load_sat_since = None
 
     def get_finished(self) -> list[tuple[JobId, bool]]:
         # No lock needed: deque is thread-safe for concurrent append/popleft,
@@ -161,7 +195,11 @@ class DualQueueThreadPool:
                     return
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
+                from_load = (primary if primary else secondary) is self._load_q
                 task, state = primary.popleft() if primary else secondary.popleft()
+                if from_load:
+                    self._load_active += 1
+                    self._track_load_saturation(time.monotonic())
             try:
                 task()
                 job_finished, success = state.task_done(True)
@@ -172,6 +210,12 @@ class DualQueueThreadPool:
                     exc,
                 )
                 job_finished, success = state.task_done(False)
+
+            if from_load:
+                with self._condition:
+                    self._load_active -= 1
+                    if self._load_q:
+                        self._load_sat_blocks += 1
 
             if job_finished:
                 with self._condition:

@@ -19,6 +19,7 @@ import functools
 import json
 import os
 import threading
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
@@ -52,7 +53,7 @@ from vllm.v1.kv_offload.tiering.base import (
 )
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
-from vllm.v1.kv_offload.tiering.queue_balance import WaitBalanceController
+from vllm.v1.kv_offload.tiering.queue_balance import CapacityRatioController
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
@@ -108,7 +109,7 @@ class FsAsyncLookupManager(AsyncLookupManager):
             )
 
         if self._tier._enable_queue_balancing and stored_count > 0:
-            load_queue_len = len(self._tier._pool._load_q)
+            load_queue_len = self._tier._pool.load_backlog()
             with self._tier._queue_balance_lock:
                 # Only count prefill blocks from requests that have
                 # no pending loads — blocked requests can't prefill.
@@ -125,9 +126,6 @@ class FsAsyncLookupManager(AsyncLookupManager):
                         + request_blocks
                     )
                     self._tier._forced_prefill_blocks += stored_count
-                    self._tier._ratio_controller.on_routed(
-                        req_context.req_id, request_blocks, forced_prefill=True
-                    )
                     logger.info(
                         "Queue balancing: forcing prefill for req %s "
                         "(%d blocks). prefill_q=%d, load_q=%d",
@@ -137,10 +135,6 @@ class FsAsyncLookupManager(AsyncLookupManager):
                         load_queue_len,
                     )
                     return [False] * request_blocks
-
-            self._tier._ratio_controller.on_routed(
-                req_context.req_id, request_blocks, forced_prefill=False
-            )
 
         return hits
 
@@ -179,11 +173,9 @@ class FileSystemTierManager(SecondaryTierManager):
         enable_kv_events: bool = False,
         locality: str | None = None,
         enable_queue_balancing: bool = False,
-        ratio_update_interval_s: float = 1.0,
         ratio_ema_alpha: float = 0.5,
+        ratio_min_busy_s: float = 0.5,
         ratio_init: float = 1.0,
-        ratio_gain: float = 0.5,
-        ratio_max_step: float = 1.5,
     ):
         """
         Args:
@@ -202,11 +194,10 @@ class FileSystemTierManager(SecondaryTierManager):
             enable_queue_balancing: When True, batch_lookup may force MISS
                 for all blocks of a request to keep the prefill queue stocked
                 relative to the load queue.
-            ratio_update_interval_s: Seconds between prefill_ratio updates.
-            ratio_ema_alpha: EMA smoothing of the per-block wait estimates.
-            ratio_init: Initial prefill_ratio.
-            ratio_gain: Exponent applied to the load/prefill wait ratio.
-            ratio_max_step: Max multiplicative ratio change per update.
+            ratio_ema_alpha: EMA smoothing of the capacity estimates.
+            ratio_min_busy_s: Busy time each capacity estimate needs before
+                it updates.
+            ratio_init: prefill_ratio used until both capacities are known.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
@@ -249,12 +240,12 @@ class FileSystemTierManager(SecondaryTierManager):
                 )
 
         self._enable_queue_balancing = enable_queue_balancing
-        self._ratio_controller = WaitBalanceController(
-            update_interval_s=ratio_update_interval_s,
+        self._tokens_per_block: int = offloading_spec.tokens_per_block[0]
+        self._ratio_controller = CapacityRatioController(
+            tokens_per_block=self._tokens_per_block,
             ema_alpha=ratio_ema_alpha,
+            min_busy_s=ratio_min_busy_s,
             init_ratio=ratio_init,
-            gain=ratio_gain,
-            max_step=ratio_max_step,
         )
         self._prefill_queue_blocks: int = 0
         self._req_prefill_blocks: dict[str, int] = {}
@@ -368,16 +359,35 @@ class FileSystemTierManager(SecondaryTierManager):
         self._lookup_manager.cleanup(req_context.req_id)
         self._reqs_with_pending_loads.discard(req_context.req_id)
         self._req_pending_load_jobs.pop(req_context.req_id, None)
-        self._ratio_controller.on_request_finished(req_context.req_id)
         with self._queue_balance_lock:
             prefill_blocks = self._req_prefill_blocks.pop(req_context.req_id, 0)
             if prefill_blocks:
                 self._prefill_queue_blocks -= prefill_blocks
 
+    def _on_schedule_end_balance(self, context: ScheduleEndContext) -> None:
+        tokens_by_req = context.prefill_tokens_by_req
+        load_blocks, load_busy_s = self._pool.pop_load_capacity_sample()
+        self._ratio_controller.on_schedule_end(
+            time.monotonic(),
+            sum(tokens_by_req.values()),
+            context.is_compute_bound,
+            load_blocks,
+            load_busy_s,
+        )
+        # Forced-prefill backlog shrinks as its blocks are computed.
+        tpb = self._tokens_per_block
+        with self._queue_balance_lock:
+            for req_id, tokens in tokens_by_req.items():
+                remaining = self._req_prefill_blocks.get(req_id)
+                if remaining:
+                    done = min(remaining, -(-tokens // tpb))
+                    self._req_prefill_blocks[req_id] = remaining - done
+                    self._prefill_queue_blocks -= done
+
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         if self._enable_queue_balancing:
-            self._ratio_controller.on_schedule_end(context.prefill_done_req_ids)
+            self._on_schedule_end_balance(context)
         self._lookup_manager.flush()
 
     @override
