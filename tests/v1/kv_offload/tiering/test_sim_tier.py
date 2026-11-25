@@ -24,12 +24,14 @@ from vllm.v1.kv_offload.base import (
     ScheduleEndContext,
     make_offload_key,
 )
+from vllm.v1.kv_offload.tiering import queue_balance
 from vllm.v1.kv_offload.tiering.base import JobMetadata
+from vllm.v1.kv_offload.tiering.fs.thread_pool import JobState
+from vllm.v1.kv_offload.tiering.queue_balance import WaitBalanceController
 from vllm.v1.kv_offload.tiering.sim.manager import SimulatedTierManager
 
 _CTX = ReqContext(req_id="test-sim")
 _MOCK_SPEC = MagicMock()
-_MOCK_SPEC.tokens_per_block = (16,)
 _NUM_BLOCKS = 8
 _BLOCK_BYTES = 64
 
@@ -276,7 +278,7 @@ class TestQueueBalancing:
             n_write_threads=2,
             enable_queue_balancing=enable,
         )
-        t._prefill_ratio = prefill_ratio
+        t._ratio_controller.ratio = prefill_ratio
         return t
 
     def _fill_load_queue(self, tier: SimulatedTierManager, count: int):
@@ -402,163 +404,100 @@ class TestQueueBalancing:
             t.shutdown()
 
 
-class TestAdaptiveRatio:
-    def _make_adaptive_tier(
-        self,
-        ratio_update_interval_s: float = 0.0,
-        ratio_ema_alpha: float = 1.0,
-    ) -> SimulatedTierManager:
-        return SimulatedTierManager(
-            offloading_spec=_MOCK_SPEC,
-            primary_kv_view=_make_primary_view(),
-            tier_type="sim",
-            n_read_threads=2,
-            n_write_threads=2,
-            enable_queue_balancing=True,
-            ratio_update_interval_s=ratio_update_interval_s,
-            ratio_ema_alpha=ratio_ema_alpha,
-        )
+class TestWaitBalanceController:
+    """The ratio must move toward equal per-block waits on both paths."""
 
-    def test_ratio_increases_when_prefill_faster(self):
-        t = self._make_adaptive_tier()
-        try:
-            t._window_prefill_tokens = 100
-            t._window_load_tokens = 20
-            t._window_start = time.monotonic() - 1.0
-            t._maybe_update_ratio()
-            assert t._prefill_ratio == pytest.approx(5.0)
-        finally:
-            t.shutdown()
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr(queue_balance.time, "monotonic", lambda: now[0])
+        return now
 
-    def test_ratio_decreases_when_load_faster(self):
-        t = self._make_adaptive_tier()
-        try:
-            t._window_prefill_tokens = 10
-            t._window_load_tokens = 50
-            t._window_start = time.monotonic() - 1.0
-            t._maybe_update_ratio()
-            assert t._prefill_ratio == pytest.approx(0.2)
-        finally:
-            t.shutdown()
+    def _run_window(self, c, clock, load_wait_s=None, prefill_wait_s=None):
+        """Route one 10-block request per path, complete it after the given
+        wait, then advance past the update interval."""
+        if load_wait_s is not None:
+            c.on_routed("load", 10, forced_prefill=False)
+        if prefill_wait_s is not None:
+            c.on_routed("pf", 10, forced_prefill=True)
+        start = clock[0]
+        for req_id, wait in (("load", load_wait_s), ("pf", prefill_wait_s)):
+            if wait is not None:
+                clock[0] = start + wait
+                c.on_schedule_end([req_id])
+                c.on_schedule_end([])
+        clock[0] = start + 2.0
+        c.on_schedule_end([])
 
-    def test_ratio_non_negative(self):
-        t = self._make_adaptive_tier()
-        try:
-            t._window_prefill_tokens = 0
-            t._window_load_tokens = 100
-            t._window_start = time.monotonic() - 1.0
-            t._maybe_update_ratio()
-            assert t._prefill_ratio >= 0.0
-            assert t._prefill_ratio == pytest.approx(0.0)
-        finally:
-            t.shutdown()
+    def _make(self, **kw):
+        kw.setdefault("update_interval_s", 1.0)
+        kw.setdefault("ema_alpha", 1.0)
+        kw.setdefault("gain", 1.0)
+        kw.setdefault("max_step", 2.0)
+        return WaitBalanceController(**kw)
 
-    def test_ratio_unchanged_when_no_loads(self):
-        t = self._make_adaptive_tier()
-        try:
-            initial = t._prefill_ratio
-            t._window_prefill_tokens = 50
-            t._window_load_tokens = 0
-            t._window_start = time.monotonic() - 1.0
-            t._maybe_update_ratio()
-            assert t._prefill_ratio == initial
-        finally:
-            t.shutdown()
+    def test_ratio_grows_when_loads_wait_longer(self, clock):
+        c = self._make()
+        self._run_window(c, clock, load_wait_s=0.15, prefill_wait_s=0.1)
+        assert c.ratio == pytest.approx(1.5)
 
-    def test_ema_smoothing(self):
-        alpha = 0.3
-        t = self._make_adaptive_tier(ratio_ema_alpha=alpha)
-        try:
-            t._prefill_ratio = 2.0
-            t._window_prefill_tokens = 80
-            t._window_load_tokens = 20
-            t._window_start = time.monotonic() - 1.0
-            t._maybe_update_ratio()
-            # raw_ratio = 80/20 = 4.0
-            # new = 0.3 * 4.0 + 0.7 * 2.0 = 1.2 + 1.4 = 2.6
-            assert t._prefill_ratio == pytest.approx(2.6)
-        finally:
-            t.shutdown()
+    def test_ratio_shrinks_when_prefills_wait_longer(self, clock):
+        c = self._make()
+        self._run_window(c, clock, load_wait_s=0.1, prefill_wait_s=0.15)
+        assert c.ratio == pytest.approx(1 / 1.5)
 
-    def test_window_counters_reset_after_update(self):
-        t = self._make_adaptive_tier()
-        try:
-            t._window_prefill_tokens = 50
-            t._window_load_tokens = 25
-            t._window_start = time.monotonic() - 1.0
-            t._maybe_update_ratio()
-            assert t._window_prefill_tokens == 0
-            assert t._window_load_tokens == 0
-        finally:
-            t.shutdown()
+    def test_ratio_stable_when_waits_equal(self, clock):
+        c = self._make(init_ratio=7.0)
+        self._run_window(c, clock, load_wait_s=0.1, prefill_wait_s=0.1)
+        assert c.ratio == pytest.approx(7.0)
 
-    def test_window_counters_reset_even_when_no_loads(self):
-        t = self._make_adaptive_tier()
-        try:
-            t._window_prefill_tokens = 50
-            t._window_load_tokens = 0
-            t._window_start = time.monotonic() - 1.0
-            t._maybe_update_ratio()
-            assert t._window_prefill_tokens == 0
-            assert t._window_load_tokens == 0
-        finally:
-            t.shutdown()
+    def test_step_is_clamped(self, clock):
+        c = self._make(max_step=1.5)
+        self._run_window(c, clock, load_wait_s=1.0, prefill_wait_s=0.01)
+        assert c.ratio == pytest.approx(1.5)
 
-    def test_ratio_not_updated_when_balancing_disabled(self):
+    def test_probes_up_when_nothing_forced(self, clock):
+        """Regression for v4's collapse: with no forced prefills the ratio
+        must rise, not settle at a value that never forces anything."""
+        c = self._make(init_ratio=0.1)
+        self._run_window(c, clock, load_wait_s=0.1)
+        assert c.ratio == pytest.approx(0.2)
+
+    def test_unchanged_without_load_traffic(self, clock):
+        c = self._make()
+        self._run_window(c, clock, prefill_wait_s=0.1)
+        assert c.ratio == pytest.approx(1.0)
+
+    def test_completion_timestamped_one_step_later(self, clock):
+        c = self._make(update_interval_s=1e9)
+        c.on_routed("r", 1, forced_prefill=False)
+        clock[0] += 0.1
+        c.on_schedule_end(["r"])
+        assert "r" in c._load.inflight
+        clock[0] += 0.05
+        c.on_schedule_end([])
+        assert "r" not in c._load.inflight
+        assert c._load.wait_sum == pytest.approx(0.15)
+
+    def test_lookup_routes_forced_request_to_prefill_path(self):
         t = SimulatedTierManager(
             offloading_spec=_MOCK_SPEC,
             primary_kv_view=_make_primary_view(),
             tier_type="sim",
             n_read_threads=2,
             n_write_threads=2,
-            enable_queue_balancing=False,
+            enable_queue_balancing=True,
         )
         try:
-            initial = t._prefill_ratio
-            t._window_prefill_tokens = 100
-            t._window_load_tokens = 10
-            t._window_start = time.monotonic() - 10.0
-            list(t.get_finished_jobs())
-            assert t._prefill_ratio == initial
-        finally:
-            t.shutdown()
-
-    def test_no_update_before_interval(self):
-        t = self._make_adaptive_tier(ratio_update_interval_s=10.0)
-        try:
-            initial = t._prefill_ratio
-            t._window_prefill_tokens = 100
-            t._window_load_tokens = 10
-            t._maybe_update_ratio()
-            assert t._prefill_ratio == initial
-        finally:
-            t.shutdown()
-
-    def test_prefill_tokens_accumulated_from_schedule_end(self):
-        t = self._make_adaptive_tier(ratio_update_interval_s=999.0)
-        try:
-            ctx = ScheduleEndContext(
-                new_req_ids=[], preempted_req_ids=(), num_prefill_tokens=42
-            )
-            t.on_schedule_end(ctx)
-            assert t._window_prefill_tokens == 42
-            t.on_schedule_end(ctx)
-            assert t._window_prefill_tokens == 84
-        finally:
-            t.shutdown()
-
-    def test_load_blocks_counted_from_finished_jobs(self):
-        t = self._make_adaptive_tier(ratio_update_interval_s=999.0)
-        try:
-            t.submit_store(_make_job(0, [0, 1, 2]))
-            t.drain_jobs()
-            list(t.get_finished_jobs())
-
-            t.submit_load(_make_job(10, [0, 1, 2]))
-            t.drain_jobs()
-            list(t.get_finished_jobs())
-
-            assert t._window_load_tokens == 3 * 16
+            t._stored_keys = {_to_key(i) for i in range(4)}
+            keys = [_to_key(i) for i in range(4)]
+            list(t._lookup_manager.batch_lookup(keys, ReqContext(req_id="hit")))
+            with t._pool._condition:
+                for _ in range(20):
+                    t._pool._load_q.append((lambda: None, JobState(-1, 1)))
+            list(t._lookup_manager.batch_lookup(keys, ReqContext(req_id="forced")))
+            assert "hit" in t._ratio_controller._load.inflight
+            assert "forced" in t._ratio_controller._prefill.inflight
         finally:
             t.shutdown()
 
