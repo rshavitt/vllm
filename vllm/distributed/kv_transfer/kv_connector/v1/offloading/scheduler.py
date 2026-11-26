@@ -348,6 +348,9 @@ class RequestOffloadState:
             )
 
 
+_COMPUTE_BOUND_FRACTION = 0.9
+
+
 def _create_req_context(req: Request) -> ReqContext:
     return ReqContext(
         req_id=req.request_id,
@@ -368,6 +371,9 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
+        self._max_num_batched_tokens: int = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
         self._connector_stats = OffloadingConnectorStats()
 
         full_attention_groups: list[int] = []
@@ -1134,6 +1140,10 @@ class OffloadingConnectorScheduler:
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
             num_prefill_tokens=num_prefill_tokens,
+            is_compute_bound=(
+                scheduler_output.total_num_scheduled_tokens
+                >= _COMPUTE_BOUND_FRACTION * self._max_num_batched_tokens
+            ),
         )
         self.manager.on_schedule_end(schedule_end_context)
 

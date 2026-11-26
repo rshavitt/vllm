@@ -44,6 +44,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_BETTA = 0.5
+
 
 class SimAsyncLookupManager(AsyncLookupManager):
     """Async lookup manager for SimulatedTierManager."""
@@ -140,7 +142,7 @@ class SimulatedTierManager(SecondaryTierManager):
         n_read_threads: int = 16,
         n_write_threads: int = 16,
         enable_queue_balancing: bool = True,
-        ratio_update_interval_s: float = 5.0,
+        ratio_update_interval_s: float = 1.0,
         ratio_ema_alpha: float = 0.3,
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
@@ -176,6 +178,8 @@ class SimulatedTierManager(SecondaryTierManager):
         self._window_start: float = time.monotonic()
         self._window_prefill_tokens: int = 0
         self._window_load_tokens: int = 0
+        self._window_prefill_idle: bool = False
+        self._window_steps: int = 0
 
         self._total_lookup_blocks: int = 0
         self._storage_hit_blocks: int = 0
@@ -320,24 +324,33 @@ class SimulatedTierManager(SecondaryTierManager):
 
         prefill_tp = self._window_prefill_tokens / elapsed
         load_tp = self._window_load_tokens / elapsed
+        load_idle = self._pool.pop_load_went_idle()
+        prefill_idle = self._window_prefill_idle or self._window_steps == 0
 
-        if load_tp > 0:
-            raw_ratio = prefill_tp / load_tp
+        old = self._prefill_ratio
+        if prefill_idle:
+            self._prefill_ratio = old + _BETTA
+        elif load_idle:
+            self._prefill_ratio = old - _BETTA
+        elif load_tp > 0:
             alpha = self._ratio_ema_alpha
-            old = self._prefill_ratio
-            self._prefill_ratio = alpha * raw_ratio + (1 - alpha) * old
-            logger.info(
-                "Adaptive ratio: %.2f -> %.2f "
-                "(prefill=%.1f tok/s, load=%.1f tok/s, raw=%.2f)",
-                old,
-                self._prefill_ratio,
-                prefill_tp,
-                load_tp,
-                raw_ratio,
-            )
+            self._prefill_ratio = alpha * (prefill_tp / load_tp) + (1 - alpha) * old
+        self._prefill_ratio = max(self._prefill_ratio, 0.0)
+        logger.info(
+            "Adaptive ratio: %.2f -> %.2f (prefill_idle=%s, load_idle=%s, "
+            "prefill=%.1f tok/s, load=%.1f tok/s)",
+            old,
+            self._prefill_ratio,
+            prefill_idle,
+            load_idle,
+            prefill_tp,
+            load_tp,
+        )
 
         self._window_prefill_tokens = 0
         self._window_load_tokens = 0
+        self._window_prefill_idle = False
+        self._window_steps = 0
         self._window_start = now
 
     def on_request_finished(self, req_context: ReqContext) -> None:
@@ -352,6 +365,10 @@ class SimulatedTierManager(SecondaryTierManager):
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         self._window_prefill_tokens += context.num_prefill_tokens
+        self._window_steps += 1
+        self._window_prefill_idle |= (
+            not context.is_compute_bound or context.num_prefill_tokens == 0
+        )
         self._lookup_manager.flush()
 
     @override

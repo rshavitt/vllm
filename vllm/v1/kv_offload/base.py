@@ -83,6 +83,8 @@ class ScheduleEndContext(NamedTuple):
     preempted_req_ids: Collection[str]
     # Number of prefill tokens computed in this step.
     num_prefill_tokens: int = 0
+    # Whether this step filled the scheduler's token budget.
+    is_compute_bound: bool = False
 
 
 class LoadStoreSpec:

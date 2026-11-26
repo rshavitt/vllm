@@ -69,6 +69,8 @@ class DualQueueThreadPool:
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
+        # Set when _load_q runs empty; guarded by _condition.
+        self._load_went_idle = False
 
         for i in range(n_read_threads):
             t = threading.Thread(
@@ -118,6 +120,13 @@ class DualQueueThreadPool:
                 self._store_q.append((fn, state))
             self._condition.notify(n_tasks)
 
+    def pop_load_went_idle(self) -> bool:
+        """Return whether _load_q was empty since the last call, and reset."""
+        with self._condition:
+            went_idle = self._load_went_idle or not self._load_q
+            self._load_went_idle = False
+            return went_idle
+
     def get_finished(self) -> list[tuple[JobId, bool]]:
         # No lock needed: deque is thread-safe for concurrent append/popleft,
         # and the manager is the sole popper.
@@ -162,6 +171,8 @@ class DualQueueThreadPool:
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
                 task, state = primary.popleft() if primary else secondary.popleft()
+                if not self._load_q:
+                    self._load_went_idle = True
             try:
                 task()
                 job_finished, success = state.task_done(True)
